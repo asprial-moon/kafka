@@ -141,17 +141,24 @@ public final class ProducerBatch {
 
     /**
      * Append the record to the current record set and return the relative offset within that record set
+     * 将单条记录追加到当前 ProducerBatch，并返回该记录对应的 FutureRecordMetadata。
      *
      * @return The RecordSend corresponding to this record or null if there isn't sufficient room.
      */
     public FutureRecordMetadata tryAppend(long timestamp, byte[] key, byte[] value, Header[] headers, Callback callback, long now) {
+        // 当前批次没有足够空间时返回 null，让 RecordAccumulator 创建新批次。
         if (!recordsBuilder.hasRoomFor(timestamp, key, value, headers)) {
             return null;
         } else {
+            // 真正把序列化后的 key/value/header 写入 MemoryRecordsBuilder。
             this.recordsBuilder.append(timestamp, key, value, headers);
+            // 维护本批次内单条记录的最大估算大小，用于后续大批次拆分等逻辑。
             this.maxRecordSize = Math.max(this.maxRecordSize, AbstractRecords.estimateSizeInBytesUpperBound(magic(),
                     recordsBuilder.compression().type(), key, value, headers));
+            // 更新最后追加时间，用于 linger、超时和 ready 判断。
             this.lastAppendTime = now;
+            // 为本条记录创建 Future。batchIndex 是它在当前批次内的相对位置，
+            // broker 返回 baseOffset 后可通过 baseOffset + batchIndex 推导该记录 offset。
             FutureRecordMetadata future = new FutureRecordMetadata(this.produceFuture, this.recordCount,
                                                                    timestamp,
                                                                    key == null ? -1 : key.length,
@@ -159,7 +166,10 @@ public final class ProducerBatch {
                                                                    Time.SYSTEM);
             // we have to keep every future returned to the users in case the batch needs to be
             // split to several new batches and resent.
+            // 保存 callback 与 future 的绑定关系，批次完成时会逐个触发 callback。
+            // 即使后续批次被拆分重试，也能通过 future chain 继续等待新批次结果。
             thunks.add(new Thunk(callback, future));
+            // recordCount 同时是下一条消息的 batchIndex。
             this.recordCount++;
             return future;
         }
@@ -422,9 +432,13 @@ public final class ProducerBatch {
 
     /**
      * A callback and the associated FutureRecordMetadata argument to pass to it.
+     * 单条记录的回调与 Future 组合。
+     * ProducerBatch 完成时会遍历 thunks，用 future 生成 RecordMetadata 并调用 callback。
      */
     private static final class Thunk {
+        // KafkaProducer#doSend 传入的回调适配器，最终会触发拦截器和用户 callback。
         final Callback callback;
+        // 当前记录的异步结果句柄。
         final FutureRecordMetadata future;
 
         Thunk(Callback callback, FutureRecordMetadata future) {

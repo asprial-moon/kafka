@@ -36,15 +36,24 @@ import java.util.stream.Collectors;
  *
  * The class keeps track of various bookkeeping information required for adaptive sticky partitioning
  * (described in detail in KIP-794).  There is one partitioner object per topic.
+ * Kafka 内置默认分区工具类。
+ * 有 key 的消息通常由 KafkaProducer#partition 直接调用 partitionForKey 做 hash 分区；
+ * 无 key 或忽略 key 的消息会在 RecordAccumulator#append 中使用这里的 sticky/adaptive 分区逻辑。
  */
 public class BuiltInPartitioner {
     private final Logger log;
+    // 当前分区器负责的 topic；每个 topic 一个 BuiltInPartitioner 实例。
     private final String topic;
+    // sticky 分区在切换前期望累计写入的字节数，通常与 batch.size 相关。
     private final int stickyBatchSize;
+    // 是否启用 rack-aware 分区选择，启用时优先选择与 Producer 同 rack 的 leader 分区。
     private final boolean rackAware;
+    // Producer 所在 rack，用于 rack-aware 分区过滤。
     private final String rack;
 
+    // 分区负载统计快照；存在时用于 adaptive partitioning，偏向负载更低的分区。
     private volatile PartitionLoadStatsHolder partitionLoadStatsHolder = null;
+    // 当前 sticky 分区信息；无 key 消息会尽量连续写入该分区以提升批次聚合。
     private final AtomicReference<StickyPartitionInfo> stickyPartitionInfo = new AtomicReference<>();
 
 
@@ -70,11 +79,15 @@ public class BuiltInPartitioner {
 
     /**
      * Calculate the next partition for the topic based on the partition load stats.
+     * 基于当前 topic 的分区负载统计计算下一个 sticky 分区。
+     * 如果没有负载统计，则在可用分区中随机选择；如果启用 rack-aware，会优先选择同 rack 的 leader 分区。
      */
     private int nextPartition(Cluster cluster) {
+        // 生成正随机数，后续用于均匀选择或按负载权重选择分区。
         int random = randomPartition();
 
         // Cache volatile variable in local variable.
+        // 缓存 volatile 引用，保证本次计算使用同一个负载统计快照。
         PartitionLoadStatsHolder partitionLoadStats = this.partitionLoadStatsHolder;
 
         int partition;
@@ -82,9 +95,11 @@ public class BuiltInPartitioner {
         if (partitionLoadStats == null) {
             // We don't have stats to do adaptive partitioning (or it's disabled), just switch to the next
             // partition based on uniform distribution.
+            // 没有负载统计时，退化为在可用分区中随机选择。
             List<PartitionInfo> availablePartitions = cluster.availablePartitionsForTopic(topic);
             if (!availablePartitions.isEmpty()) {
                 // Select only partitions with leaders in this rack if configured so, falling back if none are available.
+                // rack-aware 开启时优先选择 leader 与 Producer 同 rack 的可用分区。
                 if (rackAware) {
                     List<PartitionInfo> availablePartitionsInRack = availablePartitions.stream()
                         .filter(p -> p.leader().hasRack() && p.leader().rack().equals(rack))
@@ -97,15 +112,18 @@ public class BuiltInPartitioner {
                 partition = availablePartitions.get(random % availablePartitions.size()).partition();
             } else {
                 // We don't have available partitions, just pick one among all partitions.
+                // 如果没有 leader 可用的分区，只能在全部分区中选一个，后续发送可能等待或失败。
                 List<PartitionInfo> partitions = cluster.partitionsForTopic(topic);
                 partition = random % partitions.size();
             }
         } else {
             // Calculate next partition based on load distribution.
             // Note that partitions without leader are excluded from the partitionLoadStats.
+            // 有负载统计时，按统计权重选择分区，目标是减少向高负载分区继续写入。
 
             PartitionLoadStats partitionLoadStatsToUse = partitionLoadStats.total;
             if (rackAware && partitionLoadStats.inThisRack != null && partitionLoadStats.inThisRack.length > 0) {
+                // rack-aware 场景优先使用同 rack 分区的负载统计。
                 partitionLoadStatsToUse = partitionLoadStats.inThisRack;
             }
 
@@ -168,38 +186,49 @@ public class BuiltInPartitioner {
      *
      *  It's important that steps 3-5 are under partition's batch queue lock.
      *
+     * 获取当前 sticky 分区信息；如果还没有 sticky 分区，则创建一个。
+     * 该方法与 isPartitionChanged、updatePartitionInfo 配合使用，避免并发 append 时使用过期分区。
+     *
      * @param cluster The cluster information (needed if there is no current partition)
      * @return sticky partition info object
      */
     StickyPartitionInfo peekCurrentPartitionInfo(Cluster cluster) {
+        // 先读取当前 sticky 分区；存在则直接复用，让无 key 消息持续写入同一分区以形成更大 batch。
         StickyPartitionInfo partitionInfo = stickyPartitionInfo.get();
         if (partitionInfo != null)
             return partitionInfo;
 
         // We're the first to create it.
+        // 当前还没有 sticky 分区时，选择一个新分区并尝试 CAS 设置。
         partitionInfo = new StickyPartitionInfo(nextPartition(cluster));
         if (stickyPartitionInfo.compareAndSet(null, partitionInfo))
             return partitionInfo;
 
         // Someone has raced us.
+        // 如果并发线程已经设置成功，使用对方设置的 sticky 分区。
         return stickyPartitionInfo.get();
     }
 
     /**
      * Check if partition is changed by a concurrent thread.  NOTE this function needs to be called under
      * the partition's batch queue lock.
+     * 检查 sticky 分区是否已被并发线程切换。
+     * 该方法必须在分区 batch 队列锁内调用；返回 true 时调用方需要重新选择分区并重试。
      *
      * @param partitionInfo The sticky partition info object returned by peekCurrentPartitionInfo
      * @return true if sticky partition object is changed (race condition)
      */
     boolean isPartitionChanged(StickyPartitionInfo partitionInfo) {
         // partitionInfo may be null if the caller didn't use built-in partitioner.
+        // partitionInfo 为 null 表示当前消息不是走内置 sticky 分区器，无需判断切换。
         return partitionInfo != null && stickyPartitionInfo.get() != partitionInfo;
     }
 
     /**
      * Update partition info with the number of bytes appended and maybe switch partition.
      * NOTE this function needs to be called under the partition's batch queue lock.
+     * 更新当前 sticky 分区已追加的字节数，并在达到阈值时切换分区。
+     * 默认允许达到 stickyBatchSize 后切换分区。
      *
      * @param partitionInfo The sticky partition info object returned by peekCurrentPartitionInfo
      * @param appendedBytes The number of bytes appended to this partition
@@ -212,6 +241,8 @@ public class BuiltInPartitioner {
     /**
      * Update partition info with the number of bytes appended and maybe switch partition.
      * NOTE this function needs to be called under the partition's batch queue lock.
+     * 更新当前 sticky 分区已追加的字节数，并根据 enableSwitch 决定是否允许切换分区。
+     * 当批次尚未准备好发送时，调用方可以暂缓切换，以提升批次聚合效果。
      *
      * @param partitionInfo The sticky partition info object returned by peekCurrentPartitionInfo
      * @param appendedBytes The number of bytes appended to this partition
@@ -220,10 +251,13 @@ public class BuiltInPartitioner {
      */
     void updatePartitionInfo(StickyPartitionInfo partitionInfo, int appendedBytes, Cluster cluster, boolean enableSwitch) {
         // partitionInfo may be null if the caller didn't use built-in partitioner.
+        // 有 key 或显式分区消息不会使用 sticky partitionInfo，这里直接返回。
         if (partitionInfo == null)
             return;
 
+        // 调用方必须在分区队列锁内调用，确保 stickyPartitionInfo 没有被并发切换。
         assert partitionInfo == stickyPartitionInfo.get();
+        // 累加当前 sticky 分区已写入的估算字节数。
         int producedBytes = partitionInfo.producedBytes.addAndGet(appendedBytes);
 
         // We're trying to switch partition once we produce stickyBatchSize bytes to a partition
@@ -253,6 +287,8 @@ public class BuiltInPartitioner {
 
         if (producedBytes >= stickyBatchSize && enableSwitch || producedBytes >= stickyBatchSize * 2) {
             // We've produced enough to this partition, switch to next.
+            // 达到切换阈值且允许切换时，选择下一个 sticky 分区。
+            // 如果已经超过 2 倍阈值，即使 enableSwitch=false 也强制切换，避免长期粘住单个分区。
             StickyPartitionInfo newPartitionInfo = new StickyPartitionInfo(nextPartition(cluster));
             stickyPartitionInfo.set(newPartitionInfo);
         }
@@ -407,6 +443,8 @@ public class BuiltInPartitioner {
 
     /*
      * Default hashing function to choose a partition from the serialized key bytes
+     * 有 key 消息的默认分区算法：对序列化后的 key 做 murmur2 hash，再对分区数取模。
+     * 这保证相同 key 在分区数不变时会稳定落到同一分区。
      */
     public static int partitionForKey(final byte[] serializedKey, final int numPartitions) {
         return Utils.toPositive(Utils.murmur2(serializedKey)) % numPartitions;

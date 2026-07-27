@@ -462,24 +462,37 @@ public class TransactionManager {
         return handler.result;
     }
 
+    /**
+     * Add a topic partition to the current transaction if transactional mode is enabled.
+     * 如果当前 Producer 启用了事务，则把消息所在 TopicPartition 加入当前事务。
+     * KafkaProducer#doSend 会在消息成功追加到 RecordAccumulator 后调用该方法。
+     */
     public synchronized void maybeAddPartition(TopicPartition topicPartition) {
+        // 发送消息进入 accumulator 后，KafkaProducer 会调用这里把真实 TopicPartition 加入事务。
+        // 非事务 Producer 调用该方法不会产生事务动作。
         maybeFailWithError();
+        // 如果当前事务正处于提交/回滚等挂起状态，不能再追加 SEND 操作。
         throwIfPendingState(TransactionOperation.SEND);
 
         if (isTransactional()) {
+            // 事务 Producer 必须先完成 initTransactions，拿到 producerId/epoch 后才能登记分区。
             if (!hasProducerId()) {
                 throw new IllegalStateException("Cannot add partition " + topicPartition +
                     " to transaction before completing a call to initTransactions");
             } else if (currentState != State.IN_TRANSACTION) {
+                // 只有 beginTransaction 后的 IN_TRANSACTION 状态允许把新分区纳入事务。
                 throw new IllegalStateException("Cannot add partition " + topicPartition +
                     " to transaction while in state  " + currentState);
             } else if (isTransactionV2Enabled()) {
+                // 事务协议 V2 下，分区登记在客户端本地完成，并标记事务已经开始。
                 txnPartitionMap.getOrCreate(topicPartition);
                 partitionsInTransaction.add(topicPartition);
                 transactionStarted = true;
             } else if (transactionContainsPartition(topicPartition) || isPartitionPendingAdd(topicPartition)) {
+                // 事务协议 V1 下，如果分区已经在事务中或正在 AddPartitionsToTxn，就无需重复登记。
                 return;
             } else {
+                // V1 需要后续由 Sender 发送 AddPartitionsToTxn 请求，把分区加入事务协调器状态。
                 log.debug("Begin adding new partition {} to transaction", topicPartition);
                 txnPartitionMap.getOrCreate(topicPartition);
                 newPartitionsInTransaction.add(topicPartition);
@@ -789,26 +802,37 @@ public class TransactionManager {
         lastError = null;
     }
 
+    /**
+     * Transition the transaction manager to an error state if the exception requires it.
+     * 根据发送链路中的异常类型，决定事务管理器是否需要进入 fatal 或 abortable 错误状态。
+     * KafkaProducer#doSend 在发送前失败或 Sender 后续处理失败时会通过该方法维护事务语义。
+     */
     public synchronized void maybeTransitionToErrorState(RuntimeException exception) {
+        // 发送链路遇到异常时，事务管理器需要判断异常是否会破坏事务继续执行的能力。
         if (exception instanceof ClusterAuthorizationException
                 || exception instanceof TransactionalIdAuthorizationException
                 || exception instanceof ProducerFencedException
                 || exception instanceof UnsupportedVersionException
                 || exception instanceof InvalidPidMappingException) {
+            // 这些异常不可恢复，事务 Producer 进入 fatal error，应用只能关闭或重建 Producer。
             transitionToFatalError(exception);
         } else if (isTransactional()) {
             // RetriableExceptions from the Sender thread are converted to Abortable errors
             // because they indicate that the transaction cannot be completed after all retry attempts.
             // This conversion ensures the application layer treats these errors as abortable,
             // preventing duplicate message delivery.
+            // 对事务 Producer 来说，耗尽重试后的可重试异常也意味着当前事务无法继续提交。
+            // 转换为 abortable error 后，应用可以 abort 当前事务并开启下一轮事务。
             if (exception instanceof RetriableException ||
                     exception instanceof InvalidTxnStateException) {
                 exception = new TransactionAbortableException("Transaction Request was aborted after exhausting retries.", exception);
             }
 
+            // 支持客户端侧 epoch bump 的情况下，非完成阶段错误可能需要后续触发 epoch bump 恢复幂等状态。
             if (needToTriggerEpochBumpFromClient() && !isCompleting()) {
                 clientSideEpochBumpRequired = true;
             }
+            // 对事务内可中止错误，切换到 abortable error，要求应用显式 abortTransaction。
             transitionToAbortableError(exception);
         }
     }

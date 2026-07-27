@@ -627,13 +627,21 @@ public class Metadata implements Closeable {
      * If any non-retriable exceptions were encountered during metadata update, throw exception if the exception
      * is fatal or related to the specified topic. All exceptions from the last metadata update are cleared.
      * This is used by the producer to propagate topic metadata errors for send requests.
+     * 如果最近一次 metadata 更新发现了 fatal 错误，或当前 topic 对应的不可恢复错误，则抛给发送线程。
+     * Producer 在 waitOnMetadata 中调用它，用于把 topic 授权失败、非法 topic 等元数据错误传递给 send。
      */
     public synchronized void maybeThrowExceptionForTopic(String topic) {
         clearErrorsAndMaybeThrowException(() -> recoverableExceptionForTopic(topic));
     }
 
+    /**
+     * Clear metadata errors and throw the selected metadata exception if present.
+     * 清理 metadata 中记录的错误，并在存在 fatal 或指定 topic 相关错误时抛出异常。
+     */
     private void clearErrorsAndMaybeThrowException(Supplier<KafkaException> recoverableExceptionSupplier) {
+        // fatalException 优先级最高；没有 fatal 时再检查当前 topic 的可恢复元数据错误。
         KafkaException metadataException = Optional.ofNullable(fatalException).orElseGet(recoverableExceptionSupplier);
+        // 错误只向调用方传播一次，避免后续无关请求重复看到旧错误。
         fatalException = null;
         clearRecoverableErrors();
         if (metadataException != null)
@@ -650,7 +658,12 @@ public class Metadata implements Closeable {
             return null;
     }
 
+    /**
+     * Build a recoverable metadata exception for the specified topic.
+     * 为指定 topic 构造可恢复的 metadata 异常，例如 topic 无权限或 topic 非法。
+     */
     private KafkaException recoverableExceptionForTopic(String topic) {
+        // 只提取指定 topic 相关的授权/非法 topic 错误，避免一个 topic 的错误污染其他 topic 的发送。
         if (unauthorizedTopics.contains(topic))
             return new TopicAuthorizationException(Collections.singleton(topic));
         else if (invalidTopics.contains(topic))

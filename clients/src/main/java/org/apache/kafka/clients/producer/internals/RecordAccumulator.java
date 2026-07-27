@@ -218,13 +218,22 @@ public class RecordAccumulator {
             (config, now) -> free.availableMemory());
     }
 
+    /**
+     * Set the resolved partition on append callbacks.
+     * 将 RecordAccumulator 最终确定的真实分区回填到 append 回调中。
+     * KafkaProducer#doSend 后续会通过该分区进行事务登记、异常回调和结果元数据构造。
+     */
     private void setPartition(AppendCallbacks callbacks, int partition) {
+        // RecordAccumulator 是最终确定分区的位置之一。
+        // 通过回调把真实分区回填给 KafkaProducer.AppendCallbacks，供 doSend 后续事务登记和异常回调用。
         if (callbacks != null)
             callbacks.setPartition(partition);
     }
 
     /**
      * Check if partition concurrently changed, or we need to complete previously disabled partition change.
+     * 检查 sticky 分区是否被并发线程切换，或是否需要完成之前被延迟的分区切换。
+     * 返回 true 表示调用方应重新选择分区并重试 append。
      *
      * @param topic The topic
      * @param topicInfo The topic info
@@ -240,6 +249,8 @@ public class RecordAccumulator {
                                      BuiltInPartitioner.StickyPartitionInfo partitionInfo,
                                      Deque<ProducerBatch> deque, long nowMs,
                                      Cluster cluster) {
+        // 多线程同时向同一 topic 追加无 key 消息时，sticky partition 可能被其他线程切换。
+        // 如果发现切换，就返回 true 让 append 外层循环重新选择分区。
         if (topicInfo.builtInPartitioner.isPartitionChanged(partitionInfo)) {
             log.trace("Partition {} for topic {} switched by a concurrent append, retrying",
                     partitionInfo.partition(), topic);
@@ -248,6 +259,7 @@ public class RecordAccumulator {
 
         // We might have disabled partition switch if the queue had incomplete batches.
         // Check if all batches are full now and switch .
+        // 如果之前因为队列中还有未满批次而延迟切换分区，这里在批次都满后补上切换。
         if (allBatchesFull(deque)) {
             topicInfo.builtInPartitioner.updatePartitionInfo(partitionInfo, 0, cluster, true);
             if (topicInfo.builtInPartitioner.isPartitionChanged(partitionInfo)) {
@@ -265,6 +277,9 @@ public class RecordAccumulator {
      * <p>
      * The append result will contain the future metadata, and flag for whether the appended batch is full or a new batch is created
      * <p>
+     * 将一条序列化后的记录追加到 Producer 的内存累加器中，并返回追加结果。
+     * 如果分区未知，该方法会通过内置 sticky/adaptive 分区逻辑选择真实分区；
+     * 如果现有批次可用则复用，否则可能阻塞申请 buffer 并创建新批次。
      *
      * @param topic The topic to which this record is being sent
      * @param partition The partition to which this record is being sent or RecordMetadata.UNKNOWN_PARTITION
@@ -288,20 +303,25 @@ public class RecordAccumulator {
                                      long maxTimeToBlock,
                                      long nowMs,
                                      Cluster cluster) throws InterruptedException {
+        // 每个 topic 对应一个 TopicInfo，其中包含该 topic 的内置分区器和按分区组织的 batch 队列。
         TopicInfo topicInfo = topicInfoMap.computeIfAbsent(topic, k -> new TopicInfo(createBuiltInPartitioner(logContext, k, batchSize, partitionerRackAware, rack)));
 
         // We keep track of the number of appending thread to make sure we do not miss batches in
         // abortIncompleteBatches().
+        // 记录正在 append 的线程数，避免 abortIncompleteBatches 与追加过程并发时漏掉未完成批次。
         appendsInProgress.incrementAndGet();
         ByteBuffer buffer = null;
         if (headers == null) headers = Record.EMPTY_HEADERS;
         try {
             // Loop to retry in case we encounter partitioner's race conditions.
+            // 外层循环用于处理 sticky partition 在并发追加时发生切换的竞态。
             while (true) {
                 // If the message doesn't have any partition affinity, so we pick a partition based on the broker
                 // availability and performance.  Note, that here we peek current partition before we hold the
                 // deque lock, so we'll need to make sure that it's not changed while we were waiting for the
                 // deque lock.
+                // 如果 KafkaProducer#partition 返回 UNKNOWN_PARTITION，说明消息没有固定分区亲和性。
+                // 这里通过内置 sticky/adaptive 分区器选择当前有效分区；如果用户已指定分区则直接使用。
                 final BuiltInPartitioner.StickyPartitionInfo partitionInfo;
                 final int effectivePartition;
                 if (partition == RecordMetadata.UNKNOWN_PARTITION) {
@@ -313,18 +333,23 @@ public class RecordAccumulator {
                 }
 
                 // Now that we know the effective partition, let the caller know.
+                // 分区一旦确定，立即回填给调用方回调对象。
                 setPartition(callbacks, effectivePartition);
 
                 // check if we have an in-progress batch
+                // 获取该 topic-partition 的批次队列；队尾通常是当前可继续追加的批次。
                 Deque<ProducerBatch> dq = topicInfo.batches.computeIfAbsent(effectivePartition, k -> new ArrayDeque<>());
                 synchronized (dq) {
                     // After taking the lock, validate that the partition hasn't changed and retry.
+                    // 加锁后再次确认 sticky 分区没有被其他线程切换；如果切换则重试整个 append 流程。
                     if (partitionChanged(topic, topicInfo, partitionInfo, dq, nowMs, cluster))
                         continue;
 
+                    // 优先尝试追加到已有队尾批次，能复用批次就避免分配新 buffer。
                     RecordAppendResult appendResult = tryAppend(timestamp, key, value, headers, callbacks, dq, nowMs);
                     if (appendResult != null) {
                         // If queue has incomplete batches we disable switch (see comments in updatePartitionInfo).
+                        // 如果队列里仍有未满批次，暂缓 sticky 分区切换，以提升批次聚合效果。
                         boolean enableSwitch = allBatchesFull(dq);
                         topicInfo.builtInPartitioner.updatePartitionInfo(partitionInfo, appendResult.appendedBytes, cluster, enableSwitch);
                         return appendResult;
@@ -332,10 +357,12 @@ public class RecordAccumulator {
                 }
 
                 if (buffer == null) {
+                    // 现有批次没有空间时，按 batch.size 和单条消息估算上界中的较大值分配新 buffer。
                     int size = Math.max(this.batchSize, AbstractRecords.estimateSizeInBytesUpperBound(
                             RecordBatch.CURRENT_MAGIC_VALUE, compression.type(), key, value, headers));
                     log.trace("Allocating a new {} byte message buffer for topic {} partition {} with remaining timeout {}ms", size, topic, effectivePartition, maxTimeToBlock);
                     // This call may block if we exhausted buffer space.
+                    // BufferPool 空间不足时这里可能阻塞，最长受 KafkaProducer#doSend 传入的剩余 max.block.ms 限制。
                     buffer = free.allocate(size, maxTimeToBlock);
                     // Update the current time in case the buffer allocation blocked above.
                     // NOTE: getting time may be expensive, so calling it under a lock
@@ -345,27 +372,35 @@ public class RecordAccumulator {
 
                 synchronized (dq) {
                     // After taking the lock, validate that the partition hasn't changed and retry.
+                    // 分配 buffer 期间 sticky 分区仍可能被其他线程切换，因此入队前再校验一次。
                     if (partitionChanged(topic, topicInfo, partitionInfo, dq, nowMs, cluster))
                         continue;
 
+                    // 使用新 buffer 创建 ProducerBatch，并把当前 record 作为该批次第一条消息。
                     RecordAppendResult appendResult = appendNewBatch(topic, effectivePartition, dq, timestamp, key, value, headers, callbacks, buffer, nowMs);
                     // Set buffer to null, so that deallocate doesn't return it back to free pool, since it's used in the batch.
+                    // 新 batch 已持有该 buffer，避免 finally 中把仍在使用的 buffer 归还给 BufferPool。
                     if (appendResult.newBatchCreated)
                         buffer = null;
                     // If queue has incomplete batches we disable switch (see comments in updatePartitionInfo).
+                    // 更新 sticky 分区已写入字节数，必要时切换到下一个分区。
                     boolean enableSwitch = allBatchesFull(dq);
                     topicInfo.builtInPartitioner.updatePartitionInfo(partitionInfo, appendResult.appendedBytes, cluster, enableSwitch);
                     return appendResult;
                 }
             }
         } finally {
+            // 如果 buffer 没有被新 ProducerBatch 接管，必须归还给 BufferPool。
             free.deallocate(buffer);
+            // append 结束，递减并发追加计数。
             appendsInProgress.decrementAndGet();
         }
     }
 
     /**
      * Append a new batch to the queue
+     * 创建新的 ProducerBatch 并追加到指定分区队列。
+     * 调用前分区必须已经确定；该方法会把当前记录作为新批次的第一条记录。
      *
      * @param topic The topic
      * @param partition The partition (cannot be RecordMetadata.UNKNOWN_PARTITION)
@@ -390,20 +425,27 @@ public class RecordAccumulator {
                                               long nowMs) {
         assert partition != RecordMetadata.UNKNOWN_PARTITION;
 
+        // 在创建新批次前再尝试一次追加已有批次。
+        // 这是为了处理当前线程等待 buffer 期间，其他线程可能已经创建了可用批次的情况。
         RecordAppendResult appendResult = tryAppend(timestamp, key, value, headers, callbacks, dq, nowMs);
         if (appendResult != null) {
             // Somebody else found us a batch, return the one we waited for! Hopefully this doesn't happen often...
             return appendResult;
         }
 
+        // 用分配好的 ByteBuffer 构建 MemoryRecordsBuilder，再包装为 ProducerBatch。
         MemoryRecordsBuilder recordsBuilder = recordsBuilder(buffer);
         ProducerBatch batch = new ProducerBatch(new TopicPartition(topic, partition), recordsBuilder, nowMs);
+        // 当前 record 作为新 batch 的第一条消息，FutureRecordMetadata 会返回给用户。
         FutureRecordMetadata future = Objects.requireNonNull(batch.tryAppend(timestamp, key, value, headers,
                 callbacks, nowMs));
 
+        // 新批次追加到该分区队列尾部，等待 Sender 线程 drain。
         dq.addLast(batch);
+        // incomplete 集合跟踪所有尚未完成的批次，用于关闭、abort、超时等流程。
         incomplete.add(batch);
 
+        // newBatchCreated=true 告诉 KafkaProducer#doSend 可以唤醒 Sender。
         return new RecordAppendResult(future, dq.size() > 1 || batch.isFull(), true, batch.estimatedSizeInBytes());
     }
 
@@ -413,6 +455,8 @@ public class RecordAccumulator {
 
     /**
      * Check if all batches in the queue are full.
+     * 检查分区队列中的批次是否都已满。
+     * 只有队尾批次可能未满，因此只需要检查队尾即可。
      */
     private boolean allBatchesFull(Deque<ProducerBatch> deque) {
         // Only the last batch may be incomplete, so we just check that.
@@ -427,19 +471,27 @@ public class RecordAccumulator {
      *  resources like compression buffers. The batch will be fully closed (ie. the record batch headers will be written
      *  and memory records built) in one of the following cases (whichever comes first): right before send,
      *  if it is expired, or when the producer is closed.
+     *
+     * 尝试把记录追加到队尾已有 ProducerBatch。
+     * 如果批次空间不足则返回 null，并关闭该批次的继续追加能力，让调用方创建新批次。
      */
     private RecordAppendResult tryAppend(long timestamp, byte[] key, byte[] value, Header[] headers,
                                          Callback callback, Deque<ProducerBatch> deque, long nowMs) {
+        // Producer 已关闭时，不允许继续把消息追加到本地缓冲。
         if (closed)
             throw new KafkaException("Producer closed while send in progress");
+        // 只尝试追加队尾批次，因为队头批次可能已经 ready 或正在等待发送。
         ProducerBatch last = deque.peekLast();
         if (last != null) {
             int initialBytes = last.estimatedSizeInBytes();
+            // ProducerBatch#tryAppend 返回 null 表示该批次空间不足，需要创建新批次。
             FutureRecordMetadata future = last.tryAppend(timestamp, key, value, headers, callback, nowMs);
             if (future == null) {
+                // 队尾批次已满，关闭 record append，释放压缩 buffer 等追加期资源。
                 last.closeForRecordAppends();
             } else {
                 int appendedBytes = last.estimatedSizeInBytes() - initialBytes;
+                // 成功追加到已有 batch，newBatchCreated=false。
                 return new RecordAppendResult(future, deque.size() > 1 || last.isFull(), false, appendedBytes);
             }
         }
@@ -1252,11 +1304,17 @@ public class RecordAccumulator {
 
     /*
      * Metadata about a record just appended to the record accumulator
+     * 刚追加到 RecordAccumulator 的单条记录结果。
+     * KafkaProducer#doSend 依赖这里判断是否唤醒 Sender，并把 future 返回给用户。
      */
     public static final class RecordAppendResult {
+        // 当前 record 对应的 Future；broker ack 或发送失败后会完成。
         public final FutureRecordMetadata future;
+        // 追加后该 batch 是否已满；为 true 时 doSend 会唤醒 Sender 尽快发送。
         public final boolean batchIsFull;
+        // 本次追加是否创建了新 batch；新 batch 也会触发 Sender 唤醒。
         public final boolean newBatchCreated;
+        // 本次追加带来的 batch 估算字节增长，用于内置分区器判断 sticky 分区是否应切换。
         public final int appendedBytes;
 
         public RecordAppendResult(FutureRecordMetadata future,
@@ -1272,11 +1330,14 @@ public class RecordAccumulator {
 
     /*
      * The callbacks passed into append
+     * 传入 append 的回调扩展。
+     * 除了普通 Callback#onCompletion 外，还允许 accumulator 在确定真实分区后回填 partition。
      */
     public interface AppendCallbacks extends Callback {
         /**
          * Called to set partition (when append is called, partition may not be calculated yet).
          * @param partition The partition
+         * 当 KafkaProducer#doSend 传入 UNKNOWN_PARTITION 时，真实分区会在 append 内部确定并通过这里回填。
          */
         void setPartition(int partition);
     }
