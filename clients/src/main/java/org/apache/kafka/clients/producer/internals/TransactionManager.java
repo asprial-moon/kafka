@@ -95,18 +95,26 @@ import java.util.function.Supplier;
 
 /**
  * A class which maintains state for transactions. Also keeps the state necessary to ensure idempotent production.
+ * 事务与幂等状态管理器：Sender 通过它维护 producerId/epoch、sequence、事务请求队列和事务状态机。
  */
 public class TransactionManager {
+    // 没有事务请求在途时使用的哨兵 correlationId。
     private static final int NO_INFLIGHT_REQUEST_CORRELATION_ID = -1;
 
     private final Logger log;
+    // 事务 Producer 的 transactional.id；为 null 时表示只启用幂等或普通发送。
     private final String transactionalId;
+    // 事务在 broker 端允许保持开启的最长时间。
     private final int transactionTimeoutMs;
+    // broker API 版本信息，用于判断事务协议版本、是否支持 epoch bump 等能力。
     private final ApiVersions apiVersions;
+    // 元数据组件，用于触发 coordinator 或 broker 节点变化后的 metadata 刷新。
     private final Metadata metadata;
 
+    // 按分区维护幂等序列号、已 ack 序列、在途批次等状态。
     private final TxnPartitionMap txnPartitionMap;
 
+    // sendOffsetsToTransaction 暂存的 offset 提交信息，等待 TxnOffsetCommit 请求发送。
     private final Map<TopicPartition, CommittedOffset> pendingTxnOffsetCommits;
 
     // If a batch bound for a partition expired locally after being sent at least once, the partition is considered
@@ -118,40 +126,62 @@ public class TransactionManager {
     // The value of the map is the sequence number of the batch following the expired one, computed by adding its
     // record count to its sequence number. This is used to tell if a subsequent batch is the one immediately following
     // the expired one.
+    // 记录“已发送后在客户端过期”的分区。过期批次是否被 broker 接收不确定，所以该分区 sequence 暂时不可继续分配。
     private final Map<TopicPartition, Integer> partitionsWithUnresolvedSequences;
 
     // The partitions that have received an error that triggers an epoch bump. When the epoch is bumped, these
     // partitions will have the sequences of their in-flight batches rewritten
+    // 需要 bump epoch 后重写 sequence 的分区集合，主要服务幂等 producer 的错误恢复。
     private final Set<TopicPartition> partitionsToRewriteSequences;
 
+    // 待 Sender 发送的事务控制请求队列，按 Priority 排序。
     private final PriorityQueue<TxnRequestHandler> pendingRequests;
+    // 当前事务中新发现、尚未发送 AddPartitionsToTxn 的分区。
     private final Set<TopicPartition> newPartitionsInTransaction;
+    // 已发送 AddPartitionsToTxn 但尚未收到成功响应的分区。
     private final Set<TopicPartition> pendingPartitionsInTransaction;
+    // 已确认加入当前事务的分区；Sender 只有在分区进入这里后才允许发送事务消息。
     private final Set<TopicPartition> partitionsInTransaction;
+    // 应用线程发起 commit/abort/init 时的挂起状态转换结果，用于复用或完成用户等待。
     private PendingStateTransition pendingTransition;
 
     // This is used by the TxnRequestHandlers to control how long to back off before a given request is retried.
     // For instance, this value is lowered by the AddPartitionsToTxnHandler when it receives a CONCURRENT_TRANSACTIONS
     // error for the first AddPartitionsRequest in a transaction.
+    // 事务控制请求失败后的默认退避时间。
     private final long retryBackoffMs;
 
     // The retryBackoff is overridden to the following value if the first AddPartitions receives a
     // CONCURRENT_TRANSACTIONS error.
+    // 首次 AddPartitionsToTxn 遇到并发事务错误时使用的更短退避。
     private static final long ADD_PARTITIONS_RETRY_BACKOFF_MS = 20L;
 
+    // 当前在途事务控制请求的 correlationId；Sender 用它避免并发发送多个事务请求。
     private int inFlightRequestCorrelationId = NO_INFLIGHT_REQUEST_CORRELATION_ID;
+    // 事务 coordinator 节点缓存。
     private Node transactionCoordinator;
+    // 消费组 coordinator 节点缓存，用于事务内提交消费位移。
     private Node consumerGroupCoordinator;
+    // 当前事务 coordinator 是否支持客户端侧 bump epoch。
     private boolean coordinatorSupportsBumpingEpoch;
 
+    // 事务状态机当前状态。
     private volatile State currentState = State.UNINITIALIZED;
+    // 最近一次导致事务状态进入错误分支的异常。
     private volatile RuntimeException lastError = null;
+    // 当前全局 producerId 和 epoch。
     private volatile ProducerIdAndEpoch producerIdAndEpoch;
+    // 当前事务是否真正发送过消息或 offsets；空事务可能不需要发送 EndTxn。
     private volatile boolean transactionStarted = false;
+    // 是否需要由客户端主动 bump epoch 来恢复幂等/事务状态。
     private volatile boolean clientSideEpochBumpRequired = false;
+    // 已处理的 finalized features epoch，用于判断事务协议版本是否有更新。
     private volatile long latestFinalizedFeaturesEpoch = -1;
+    // 当前是否启用事务协议 V2。
     private volatile boolean isTransactionV2Enabled = false;
+    // 是否启用两阶段提交事务。
     private final boolean enable2PC;
+    // 2PC prepare 后保存的 producerId/epoch 状态。
     private volatile ProducerIdAndEpoch preparedTxnState = ProducerIdAndEpoch.NONE;
 
     private enum State {
@@ -704,9 +734,11 @@ public class TransactionManager {
     synchronized void bumpIdempotentEpochAndResetIdIfNeeded() {
         if (!isTransactional()) {
             if (clientSideEpochBumpRequired) {
+                // 非事务幂等 producer 可通过 bump epoch 重置受影响分区 sequence。
                 bumpIdempotentProducerEpoch();
             }
             if (currentState != State.INITIALIZING && !hasProducerId()) {
+                // 没有 producerId 时，入队 InitProducerId；Sender 会优先发送该控制请求。
                 transitionTo(State.INITIALIZING);
                 InitProducerIdRequestData requestData = new InitProducerIdRequestData()
                         .setTransactionalId(null)
@@ -784,13 +816,16 @@ public class TransactionManager {
     }
 
     public synchronized void handleCompletedBatch(ProducerBatch batch, ProduceResponse.PartitionResponse response) {
+        // 成功 ack 后推进该分区最后确认的 sequence，用于后续判断 sequence 是否连续。
         int lastAckedSequence = maybeUpdateLastAckedSequence(batch.topicPartition, batch.lastSequence());
         log.trace("ProducerId: {}; Set last ack'd sequence number for topic-partition {} to {}",
                 batch.producerId(),
                 batch.topicPartition,
                 lastAckedSequence);
 
+        // 记录最后成功写入的 offset，事务/幂等恢复时会用到。
         updateLastAckedOffset(response, batch);
+        // batch 已完成，从事务管理器的 in-flight 跟踪中移除。
         removeInFlightBatch(batch);
     }
 
@@ -838,7 +873,9 @@ public class TransactionManager {
     }
 
     synchronized void handleFailedBatch(ProducerBatch batch, RuntimeException exception, boolean adjustSequenceNumbers) {
+        // 根据异常类型决定是否进入 abortable/fatal error，或标记需要 bump epoch。
         maybeTransitionToErrorState(exception);
+        // 失败批次不再处于事务管理器的 in-flight 序列跟踪中。
         removeInFlightBatch(batch);
 
         if (hasFatalError()) {
@@ -854,6 +891,7 @@ public class TransactionManager {
 
             // If we fail with an OutOfOrderSequenceException, we have a gap in the log. Bump the epoch for this
             // partition, which will reset the sequence number to 0 and allow us to continue
+            // 非事务幂等发送遇到乱序 sequence，说明本地和 broker 状态不一致，需要 bump epoch 后从 0 重建分区序列。
             requestIdempotentEpochBumpForPartition(batch.topicPartition);
         } else if (exception instanceof UnknownProducerIdException) {
             // If we get an UnknownProducerId for a partition, then the broker has no state for that producer. It will
@@ -861,12 +899,15 @@ public class TransactionManager {
             // that the producer can continue after aborting the transaction. All inflight-requests to this partition
             // will also fail with an UnknownProducerId error, so the sequence will remain at 0. Note that if the
             // broker supports bumping the epoch, we will later reset all sequence numbers after calling InitProducerId
+            // broker 丢失 producerId 状态时，先把该分区 sequence 重置为 0，后续可能再通过 InitProducerId/bump epoch 恢复。
             resetSequenceForPartition(batch.topicPartition);
         } else {
             if (adjustSequenceNumbers) {
                 if (!isTransactional()) {
+                    // 非事务幂等 producer 通过 bump epoch 恢复，不直接改当前事务状态。
                     requestIdempotentEpochBumpForPartition(batch.topicPartition);
                 } else {
+                    // 事务 producer 需要在本地调整后续批次 sequence，避免失败批次留下序列空洞。
                     txnPartitionMap.adjustSequencesDueToFailedBatch(batch);
                 }
             }
@@ -890,6 +931,7 @@ public class TransactionManager {
     }
 
     synchronized void markSequenceUnresolved(ProducerBatch batch) {
+        // 记录过期批次之后的下一个 sequence；后续如果这个 sequence 能衔接上 lastAckedSequence，则说明状态已恢复。
         int nextSequence = batch.lastSequence() + 1;
         partitionsWithUnresolvedSequences.compute(batch.topicPartition,
             (k, v) -> v == null ? nextSequence : Math.max(v, nextSequence));
@@ -899,20 +941,26 @@ public class TransactionManager {
 
     // Attempts to resolve unresolved sequences. If all in-flight requests are complete and some partitions are still
     // unresolved, either bump the epoch if possible, or transition to a fatal error
+    // 尝试恢复 unresolved sequence 分区：只有该分区所有 in-flight 批次都返回后，才能判断过期批次是否真的丢失。
     synchronized void maybeResolveSequences() {
         for (Iterator<TopicPartition> iter = partitionsWithUnresolvedSequences.keySet().iterator(); iter.hasNext(); ) {
+            // 当前需要检查 sequence 是否已恢复连续的分区。
             TopicPartition topicPartition = iter.next();
             if (!hasInflightBatches(topicPartition)) {
                 // The partition has been fully drained. At this point, the last ack'd sequence should be one less than
                 // next sequence destined for the partition. If so, the partition is fully resolved. If not, we should
                 // reset the sequence number if necessary.
+                // 没有 in-flight 批次后，如果 nextSequence 正好等于 lastAcked + 1，说明之前过期批次最终被 broker 接收。
                 if (isNextSequence(topicPartition, sequenceNumber(topicPartition))) {
                     // This would happen when a batch was expired, but subsequent batches succeeded.
+                    // sequence 已恢复连续，解除该分区 unresolved 标记，后续可继续分配 sequence。
                     iter.remove();
                 } else {
                     // We would enter this branch if all in flight batches were ultimately expired in the producer.
+                    // sequence 不连续，说明过期批次没有成功确认；需要按事务/幂等模式分别恢复。
                     if (isTransactional()) {
                         // For the transactional producer, we bump the epoch if possible, otherwise we transition to a fatal error
+                        // 事务 producer 不能悄悄跳过消息，只能进入可中止错误或 fatal error，由应用 abort 或重建 producer。
                         String unackedMessagesErr = "The client hasn't received acknowledgment for some previously " +
                                 "sent messages and can no longer retry them. ";
                         KafkaException abortableException = new KafkaException(unackedMessagesErr + "It is safe to abort " +
@@ -922,6 +970,7 @@ public class TransactionManager {
                         transitionToAbortableErrorOrFatalError(abortableException, fatalException);
                     } else {
                         // For the idempotent producer, bump the epoch
+                        // 非事务幂等 producer 可以 bump epoch 并重置 sequence，继续后续发送。
                         log.info("No inflight batches remaining for {}, last ack'd sequence for partition is {}, next sequence is {}. " +
                                         "Going to bump epoch and reset sequence numbers.", topicPartition,
                                 lastAckedSequence(topicPartition).orElse(TxnPartitionEntry.NO_LAST_ACKED_SEQUENCE_NUMBER), sequenceNumber(topicPartition));
@@ -935,26 +984,32 @@ public class TransactionManager {
     }
 
     private boolean isNextSequence(TopicPartition topicPartition, int sequence) {
+        // 判断待发送 sequence 是否紧跟该分区最后 ack 的 sequence。
         return sequence - lastAckedSequence(topicPartition).orElse(TxnPartitionEntry.NO_LAST_ACKED_SEQUENCE_NUMBER) == 1;
     }
 
     private boolean isNextSequenceForUnresolvedPartition(TopicPartition topicPartition, int sequence) {
+        // 判断当前重试 batch 是否正好是 unresolved 分区中过期批次后面的第一批。
         return this.hasUnresolvedSequence(topicPartition) &&
                 sequence == this.partitionsWithUnresolvedSequences.get(topicPartition);
     }
 
     synchronized TxnRequestHandler nextRequest(boolean hasIncompleteBatches) {
         if (!newPartitionsInTransaction.isEmpty())
+            // 新分区需要先转成 AddPartitionsToTxn 请求入队，保证事务 coordinator 知道这些分区。
             enqueueRequest(addPartitionsToTransactionHandler());
 
+        // 查看优先级最高的事务控制请求，但先不出队，后面还要检查是否可以发送。
         TxnRequestHandler nextRequestHandler = pendingRequests.peek();
         if (nextRequestHandler == null)
             return null;
 
         // Do not send the EndTxn until all batches have been flushed
+        // EndTxn 必须等所有消息批次完成，否则 broker 可能先提交事务，再收到属于该事务的 ProduceRequest。
         if (nextRequestHandler.isEndTxn() && hasIncompleteBatches)
             return null;
 
+        // 通过前置检查后，事务请求才真正从队列出队交给 Sender 发送。
         pendingRequests.poll();
         if (maybeTerminateRequestWithError(nextRequestHandler)) {
             log.trace("Not sending transactional request {} because we are in an error state",
@@ -963,6 +1018,7 @@ public class TransactionManager {
         }
 
         if (nextRequestHandler.isEndTxn() && !transactionStarted) {
+            // 空事务没有发送消息或 offsets，可以直接完成 EndTxn 结果，不必真的发 EndTxn 请求。
             nextRequestHandler.result.done();
             if (currentState != State.FATAL_ERROR) {
                 if (isTransactionV2Enabled) {
@@ -984,21 +1040,26 @@ public class TransactionManager {
     }
 
     synchronized void retry(TxnRequestHandler request) {
+        // 标记为重试请求，使后续发送前应用 retry backoff。
         request.setRetry();
+        // 重新入队，等待 Sender 下一轮按优先级取出。
         enqueueRequest(request);
     }
 
     synchronized void authenticationFailed(AuthenticationException e) {
+        // 认证失败会污染所有待发送事务请求，让它们以 fatal error 完成。
         for (TxnRequestHandler request : pendingRequests)
             request.fatalError(e);
     }
 
     synchronized void failPendingRequests(RuntimeException exception) {
+        // 授权类 abortable 错误下，当前待发送请求直接失败并交给应用处理。
         pendingRequests.forEach(handler ->
                 handler.abortableError(exception));
     }
 
     synchronized void close() {
+        // 强制关闭时，所有 pending 事务请求都以关闭异常失败。
         KafkaException shutdownException = new KafkaException("The producer closed forcefully");
         pendingRequests.forEach(handler ->
                 handler.fatalError(shutdownException));
@@ -1008,6 +1069,7 @@ public class TransactionManager {
     }
 
     Node coordinator(FindCoordinatorRequest.CoordinatorType type) {
+        // 根据请求类型返回缓存的事务 coordinator 或消费组 coordinator。
         switch (type) {
             case GROUP:
                 return consumerGroupCoordinator;
@@ -1019,10 +1081,12 @@ public class TransactionManager {
     }
 
     void lookupCoordinator(TxnRequestHandler request) {
+        // 根据事务请求携带的 coordinator 类型和 key 发起查找。
         lookupCoordinator(request.coordinatorType(), request.coordinatorKey());
     }
 
     void setInFlightCorrelationId(int correlationId) {
+        // 记录正在等待响应的事务控制请求 correlationId，Sender 用它判断是否已有事务请求在途。
         inFlightRequestCorrelationId = correlationId;
     }
 
@@ -1031,6 +1095,7 @@ public class TransactionManager {
     }
 
     boolean hasInFlightRequest() {
+        // 只允许一个事务控制请求在途，避免事务状态机并发推进。
         return inFlightRequestCorrelationId != NO_INFLIGHT_REQUEST_CORRELATION_ID;
     }
 
@@ -1065,6 +1130,7 @@ public class TransactionManager {
     }
 
     synchronized boolean canRetry(ProduceResponse.PartitionResponse response, ProducerBatch batch) {
+        // Sender 在处理 ProduceResponse 错误时调用，用于判断该 batch 在当前幂等/事务语义下能否重试。
         Errors error = response.error;
 
         // An UNKNOWN_PRODUCER_ID means that we have lost the producer state on the broker. Depending on the log start

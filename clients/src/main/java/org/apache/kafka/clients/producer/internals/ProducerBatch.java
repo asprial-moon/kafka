@@ -61,32 +61,52 @@ public final class ProducerBatch {
 
     private static final Logger log = LoggerFactory.getLogger(ProducerBatch.class);
 
+    // batch 的最终状态：中止、失败或成功。null 表示尚未完成。
     private enum FinalState { ABORTED, FAILED, SUCCEEDED }
 
+    // batch 创建时间，用于 delivery.timeout.ms、queue time、等待时间等计算。
     final long createdMs;
+    // 当前 batch 归属的 topic-partition；一个 ProducerBatch 只属于一个分区。
     final TopicPartition topicPartition;
+    // batch 级异步结果，batch 内每条记录的 FutureRecordMetadata 都依赖它完成。
     final ProduceRequestResult produceFuture;
 
+    // batch 内每条 record 对应的 callback/future 绑定关系，完成 batch 时逐个触发。
     private final List<Thunk> thunks = new ArrayList<>();
+    // 真正写入 record 二进制数据的构建器，底层持有 ByteBuffer。
     private final MemoryRecordsBuilder recordsBuilder;
+    // 已发送尝试次数；重试入队时递增。
     private final AtomicInteger attempts = new AtomicInteger(0);
+    // 标记该 batch 是否由大批次拆分而来；拆分批次的内存不从 BufferPool 分配。
     private final boolean isSplitBatch;
+    // batch 最终状态的原子引用，保证成功/失败/中止只会有一个最终结果生效。
     private final AtomicReference<FinalState> finalState = new AtomicReference<>(null);
+    // 当前 batch 底层 buffer 是否已经归还或标记释放，避免重复释放。
     private boolean bufferDeallocated = false;
     // Tracks if the batch has been sent to the NetworkClient
+    // 是否已经交给 NetworkClient 发送；in-flight batch 的 buffer 不能被立即复用。
     private boolean inflight = false;
 
+    // batch 内 record 数量，同时也是下一条 record 的 batchIndex。
     int recordCount;
+    // batch 内最大单条 record 的估算大小，用于指标和大批次拆分判断。
     int maxRecordSize;
+    // 最近一次发送尝试时间，用于 retry backoff 等等待时间计算。
     private long lastAttemptMs;
+    // 最近一次 append record 的时间，用于 linger.ms、过期和 ready 判断。
     private long lastAppendTime;
+    // batch 被 Sender 从 accumulator drain 出来的时间，用于 queue-time 指标。
     private long drainedMs;
+    // 标记该 batch 是否处于重试流程。
     private boolean retry;
+    // 标记 batch 是否曾因 producerId/epoch/sequence 重写而重新打开。
     private boolean reopened;
 
     // Tracks the current-leader's epoch to which this batch would be sent, in the current to produce the batch.
+    // 当前尝试发送时目标 leader 的 epoch，用于判断重试期间 leader 是否发生变化。
     private OptionalInt currentLeaderEpoch;
     // Tracks the attempt in which leader was changed to currentLeaderEpoch for the 1st time.
+    // 第一次观察到 currentLeaderEpoch 变化时的发送尝试次数，用于跳过不必要的 retry backoff。
     private int attemptsWhenLeaderLastChanged;
 
     public ProducerBatch(TopicPartition tp, MemoryRecordsBuilder recordsBuilder, long createdMs) {
@@ -143,7 +163,14 @@ public final class ProducerBatch {
      * Append the record to the current record set and return the relative offset within that record set
      * 将单条记录追加到当前 ProducerBatch，并返回该记录对应的 FutureRecordMetadata。
      *
+     * @param timestamp 当前记录时间戳
+     * @param key 当前记录 key 字节数组，可能为 null
+     * @param value 当前记录 value 字节数组，可能为 null
+     * @param headers 当前记录 headers
+     * @param callback 当前记录完成时要触发的 callback
+     * @param now 当前追加时间，用于更新 batch 的 lastAppendTime
      * @return The RecordSend corresponding to this record or null if there isn't sufficient room.
+     *         返回当前记录的 FutureRecordMetadata；如果当前 batch 空间不足则返回 null。
      */
     public FutureRecordMetadata tryAppend(long timestamp, byte[] key, byte[] value, Header[] headers, Callback callback, long now) {
         // 当前批次没有足够空间时返回 null，让 RecordAccumulator 创建新批次。
@@ -159,6 +186,7 @@ public final class ProducerBatch {
             this.lastAppendTime = now;
             // 为本条记录创建 Future。batchIndex 是它在当前批次内的相对位置，
             // broker 返回 baseOffset 后可通过 baseOffset + batchIndex 推导该记录 offset。
+            // key/value 长度会进入 RecordMetadata，null 用 -1 表示。
             FutureRecordMetadata future = new FutureRecordMetadata(this.produceFuture, this.recordCount,
                                                                    timestamp,
                                                                    key == null ? -1 : key.length,
@@ -177,24 +205,39 @@ public final class ProducerBatch {
 
     /**
      * This method is only used by {@link #split(int)} when splitting a large batch to smaller ones.
+     * 仅在大批次拆分时使用：把原批次中的 record 追加到拆分后的新批次。
+     *
+     * @param timestamp 原 record 时间戳
+     * @param key 原 record key buffer
+     * @param value 原 record value buffer
+     * @param headers 原 record headers
+     * @param thunk 原 record 的 callback/future 绑定关系，需要迁移到拆分后的批次
      * @return true if the record has been successfully appended, false otherwise.
+     *         追加成功返回 true；新拆分批次空间不足返回 false。
      */
     private boolean tryAppendForSplit(long timestamp, ByteBuffer key, ByteBuffer value, Header[] headers, Thunk thunk) {
+        // 拆分后的目标 batch 空间不足时，让调用方创建下一个拆分 batch。
         if (!recordsBuilder.hasRoomFor(timestamp, key, value, headers)) {
             return false;
         } else {
             // No need to get the CRC.
+            // 拆分场景直接把原 record 内容写入新 batch。
             this.recordsBuilder.append(timestamp, key, value, headers);
+            // 更新拆分批次中的最大单条记录大小。
             this.maxRecordSize = Math.max(this.maxRecordSize, AbstractRecords.estimateSizeInBytesUpperBound(magic(),
                     recordsBuilder.compression().type(), key, value, headers));
+            // 为拆分后的批次创建新的 FutureRecordMetadata，并保持 batchIndex 与新批次内位置一致。
             FutureRecordMetadata future = new FutureRecordMetadata(this.produceFuture, this.recordCount,
                                                                    timestamp,
                                                                    key == null ? -1 : key.remaining(),
                                                                    value == null ? -1 : value.remaining(),
                                                                    Time.SYSTEM);
             // Chain the future to the original thunk.
+            // 原用户 Future 需要链到拆分后的新 Future，确保用户等待的是拆分后真正发送的结果。
             thunk.future.chain(future);
+            // 复用原 callback 绑定关系，拆分后仍能触发同一个用户 callback。
             this.thunks.add(thunk);
+            // 推进拆分批次内下一条 record 的 batchIndex。
             this.recordCount++;
             return true;
         }
@@ -215,6 +258,7 @@ public final class ProducerBatch {
 
     /**
      * Check if the batch has been completed (either successfully or exceptionally).
+     * 判断批次是否已经进入最终状态；成功、失败、abort 都算完成。
      * @return `true` if the batch has been completed, `false` otherwise.
      */
     public boolean isDone() {
@@ -223,18 +267,21 @@ public final class ProducerBatch {
 
     /**
      * Complete the batch successfully.
+     * 成功完成批次：broker 已返回成功响应，baseOffset/logAppendTime 会写入每条 record 的 Future。
      * @param baseOffset The base offset of the messages assigned by the server
      * @param logAppendTime The log append time or -1 if CreateTime is being used
      * @return true if the batch was completed as a result of this call, and false
      *   if it had been completed previously
      */
     public boolean complete(long baseOffset, long logAppendTime) {
+        // 成功路径没有异常映射，所有 record 都会得到 RecordMetadata。
         return done(baseOffset, logAppendTime, null, null);
     }
 
     /**
      * Complete the batch exceptionally. The provided top-level exception will be used
      * for each record future contained in the batch.
+     * 异常完成批次：Sender 失败或 broker 返回错误时调用，batch 内 record 会按异常映射完成失败。
      *
      * @param topLevelException top-level partition error
      * @param recordExceptions Record exception function mapping batchIndex to the respective record exception
@@ -247,6 +294,7 @@ public final class ProducerBatch {
     ) {
         Objects.requireNonNull(topLevelException);
         Objects.requireNonNull(recordExceptions);
+        // 失败路径没有有效 offset/timestamp，使用协议中的无效占位值。
         return done(ProduceResponse.INVALID_OFFSET, RecordBatch.NO_TIMESTAMP, topLevelException, recordExceptions);
     }
 
@@ -275,6 +323,7 @@ public final class ProducerBatch {
         RuntimeException topLevelException,
         Function<Integer, RuntimeException> recordExceptions
     ) {
+        // topLevelException 为空表示成功，否则表示失败；abort 会通过其他路径设置 ABORTED。
         final FinalState tryFinalState = (topLevelException == null) ? FinalState.SUCCEEDED : FinalState.FAILED;
         if (tryFinalState == FinalState.SUCCEEDED) {
             log.trace("Successfully produced messages to {} with base offset {}.", topicPartition, baseOffset);
@@ -282,6 +331,7 @@ public final class ProducerBatch {
             log.trace("Failed to produce messages to {} with base offset {}.", topicPartition, baseOffset, topLevelException);
         }
 
+        // 只有第一个完成者能设置最终状态，并真正触发 Future/callback。
         if (this.finalState.compareAndSet(null, tryFinalState)) {
             completeFutureAndFireCallbacks(baseOffset, logAppendTime, recordExceptions);
             return true;
@@ -290,15 +340,18 @@ public final class ProducerBatch {
         if (this.finalState.get() != FinalState.SUCCEEDED) {
             if (tryFinalState == FinalState.SUCCEEDED) {
                 // Log if a previously unsuccessful batch succeeded later on.
+                // 客户端先判定失败/abort，但 broker 后来返回成功；只记录，不重复触发 callback。
                 log.debug("ProduceResponse returned {} for {} after batch with base offset {} had already been {}.",
                     tryFinalState, topicPartition, baseOffset, this.finalState.get());
             } else {
                 // FAILED --> FAILED and ABORTED --> FAILED transitions are ignored.
+                // 多条失败路径竞争完成同一批次时忽略后来的失败状态。
                 log.debug("Ignored state transition {} -> {} for {} batch with base offset {}",
                     this.finalState.get(), tryFinalState, topicPartition, baseOffset);
             }
         } else {
             // A SUCCESSFUL batch must not attempt another state change.
+            // 已成功的批次不能再转失败，否则会破坏用户已观察到的发送结果。
             throw new IllegalStateException("A " + this.finalState.get() + " batch must not attempt another state change to " + tryFinalState);
         }
         return false;
@@ -310,17 +363,22 @@ public final class ProducerBatch {
         Function<Integer, RuntimeException> recordExceptions
     ) {
         // Set the future before invoking the callbacks as we rely on its state for the `onCompletion` call
+        // 先设置 Future 结果，再执行 callback；callback 中可能读取 Future 状态。
         produceFuture.set(baseOffset, logAppendTime, recordExceptions);
 
         // execute callbacks
+        // 逐条 record 触发对应 callback；一个 batch 可能包含多条 record。
         for (int i = 0; i < thunks.size(); i++) {
             try {
+                // thunk 保存单条 record 的 callback 和 FutureRecordMetadata。
                 Thunk thunk = thunks.get(i);
                 if (thunk.callback != null) {
                     if (recordExceptions == null) {
+                        // 成功路径通过 FutureRecordMetadata 生成 RecordMetadata。
                         RecordMetadata metadata = thunk.future.value();
                         thunk.callback.onCompletion(metadata, null);
                     } else {
+                        // 失败路径按 batchIndex 获取该 record 对应的异常。
                         RuntimeException exception = recordExceptions.apply(i);
                         thunk.callback.onCompletion(null, exception);
                     }
@@ -330,6 +388,7 @@ public final class ProducerBatch {
             }
         }
 
+        // 标记 ProduceRequestResult 完成，唤醒等待 Future.get()/flush 的线程。
         produceFuture.done();
     }
 
@@ -453,6 +512,7 @@ public final class ProducerBatch {
     }
 
     boolean hasReachedDeliveryTimeout(long deliveryTimeoutMs, long now) {
+        // 从 batch 创建时间开始计算交付超时，覆盖排队、发送、重试和等待响应全过程。
         return deliveryTimeoutMs <= now - this.createdMs;
     }
 
@@ -461,25 +521,31 @@ public final class ProducerBatch {
     }
 
     int attempts() {
+        // 已尝试发送次数；首次发送前为 0，重试入队时递增。
         return attempts.get();
     }
 
     void reenqueued(long now) {
+        // 批次重新入队表示一次发送尝试已经失败，增加 attempts 并刷新重试等待起点。
         attempts.getAndIncrement();
         lastAttemptMs = Math.max(lastAppendTime, now);
         lastAppendTime = Math.max(lastAppendTime, now);
+        // 标记该 batch 处于重试状态，Sender/TransactionManager 会据此处理 sequence 和超时。
         retry = true;
     }
 
     long queueTimeMs() {
+        // batch 从创建到被 Sender drain 的排队时间。
         return drainedMs - createdMs;
     }
 
     long waitedTimeMs(long nowMs) {
+        // 距离上次发送尝试已经等待多久，用于 retryBackoff 判断。
         return Math.max(0, nowMs - lastAttemptMs);
     }
 
     void drained(long nowMs) {
+        // 记录 batch 被 accumulator drain 出来的时间。
         this.drainedMs = Math.max(drainedMs, nowMs);
     }
 
@@ -489,12 +555,14 @@ public final class ProducerBatch {
 
     /**
      * Returns if the batch is been retried for sending to kafka
+     * 判断该 batch 是否已经经历过发送失败并重新入队。
      */
     public boolean inRetry() {
         return this.retry;
     }
 
     public MemoryRecords records() {
+        // 构建并返回底层 MemoryRecords，Sender 会把它直接放入 ProduceRequest。
         return recordsBuilder.build();
     }
 
@@ -511,6 +579,7 @@ public final class ProducerBatch {
     }
 
     public void setProducerState(ProducerIdAndEpoch producerIdAndEpoch, int baseSequence, boolean isTransactional) {
+        // 在 batch header 中写入 producerId、epoch、baseSequence 和事务标记。
         recordsBuilder.setProducerState(producerIdAndEpoch.producerId, producerIdAndEpoch.epoch, baseSequence, isTransactional);
     }
 
@@ -530,6 +599,7 @@ public final class ProducerBatch {
     }
 
     public void close() {
+        // 关闭 recordsBuilder，完成压缩/校验和等收尾，之后不能继续 append record。
         recordsBuilder.close();
         if (!recordsBuilder.isControlBatch()) {
             CompressionRatioEstimator.updateEstimation(topicPartition.topic(),
@@ -587,6 +657,7 @@ public final class ProducerBatch {
     }
 
     public boolean hasSequence() {
+        // baseSequence 不是 NO_SEQUENCE 表示该批次已被分配幂等序列号。
         return baseSequence() != RecordBatch.NO_SEQUENCE;
     }
 
@@ -607,10 +678,12 @@ public final class ProducerBatch {
     }
 
     public boolean isInflight() {
+        // batch 是否已经进入 NetworkClient 发送链路但尚未最终完成。
         return inflight;
     }
 
     public void setInflight(boolean inflight) {
+        // Sender 构造 ProduceRequest 时置为 true，响应完成或失败处理时再置回 false。
         this.inflight = inflight;
     }
 
