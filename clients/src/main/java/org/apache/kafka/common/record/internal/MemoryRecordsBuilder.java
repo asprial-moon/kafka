@@ -451,29 +451,37 @@ public class MemoryRecordsBuilder implements AutoCloseable {
 
     /**
      * Append a new record at the given offset.
+     * 在指定 offset 位置追加一条 record；这里负责格式校验，并按消息格式版本选择 v2 默认格式或旧版格式写入。
      */
     private void appendWithOffset(long offset, boolean isControlRecord, long timestamp, ByteBuffer key,
                                   ByteBuffer value, Header[] headers) {
         try {
+            // 控制消息只能写入控制批次，普通生产消息不能混入控制批次。
             if (isControlRecord != isControlBatch)
                 throw new IllegalArgumentException("Control records can only be appended to control batches");
 
+            // batch 内 offset 必须单调递增；Producer 侧通常从 baseOffset 开始连续追加。
             if (lastOffset != null && offset <= lastOffset)
                 throw new IllegalArgumentException(String.format("Illegal offset %d following previous offset %d " +
                         "(Offsets must increase monotonically).", offset, lastOffset));
 
+            // RecordBatch.NO_TIMESTAMP 是协议中的“无时间戳”占位值，其它负数时间戳都非法。
             if (timestamp < 0 && timestamp != RecordBatch.NO_TIMESTAMP)
                 throw new IllegalArgumentException("Invalid negative timestamp " + timestamp);
 
+            // magic 表示消息格式版本；v0/v1 旧格式不支持 headers，只有 v2 及以后支持。
             if (magic < RecordBatch.MAGIC_VALUE_V2 && headers != null && headers.length > 0)
                 throw new IllegalArgumentException("Magic v" + magic + " does not support record headers");
 
+            // 第一条 record 的 timestamp 会成为 baseTimestamp，后续 v2 record 以 timestampDelta 形式编码。
             if (baseTimestamp == null)
                 baseTimestamp = timestamp;
 
             if (magic > RecordBatch.MAGIC_VALUE_V1) {
+                // magic v2 及以后使用 DefaultRecord 格式，支持 headers、事务、幂等序列等新语义。
                 appendDefaultRecord(offset, timestamp, key, value, headers);
             } else {
+                // magic v0/v1 使用 LegacyRecord 格式，字段布局和 offset/timestamp 编码方式不同。
                 appendLegacyRecord(offset, timestamp, key, value, magic);
             }
         } catch (IOException e) {
@@ -569,8 +577,10 @@ public class MemoryRecordsBuilder implements AutoCloseable {
      * @param key The record key
      * @param value The record value
      * @param headers The record headers if there are any
+     * 将 record 追加到下一个连续 offset；Producer 追加路径会先把 byte[] 包装成 ByteBuffer 再写入底层流。
      */
     public void append(long timestamp, ByteBuffer key, ByteBuffer value, Header[] headers) {
+        // nextSequentialOffset() 生成当前 batch 内的下一个顺序 offset，不是 broker 最终返回的日志 offset。
         appendWithOffset(nextSequentialOffset(), timestamp, key, value, headers);
     }
 
@@ -590,8 +600,10 @@ public class MemoryRecordsBuilder implements AutoCloseable {
      * @param key The record key
      * @param value The record value
      * @param headers The record headers if there are any
+     * ProducerBatch#tryAppend 调用该方法写入已序列化的 key/value/header。
      */
     public void append(long timestamp, byte[] key, byte[] value, Header[] headers) {
+        // wrapNullable 将 nullable byte[] 转为 nullable ByteBuffer，保留 key/value 为 null 的语义。
         append(timestamp, wrapNullable(key), wrapNullable(value), headers);
     }
 
@@ -755,8 +767,11 @@ public class MemoryRecordsBuilder implements AutoCloseable {
     private void appendDefaultRecord(long offset, long timestamp, ByteBuffer key, ByteBuffer value,
                                      Header[] headers) throws IOException {
         ensureOpenForRecordAppend();
+        // v2 record 不直接存绝对 offset，而是存相对 baseOffset 的 offsetDelta，节省批次内编码空间。
         int offsetDelta = (int) (offset - baseOffset);
+        // v2 record 不直接存绝对 timestamp，而是存相对 baseTimestamp 的 timestampDelta。
         long timestampDelta = timestamp - baseTimestamp;
+        // DefaultRecord.writeTo 返回本条 record 的未压缩编码大小，用于维护 batch 已写入大小。
         int sizeInBytes = DefaultRecord.writeTo(appendStream, offsetDelta, timestampDelta, key, value, headers);
         recordWritten(offset, timestamp, sizeInBytes);
     }
@@ -764,12 +779,16 @@ public class MemoryRecordsBuilder implements AutoCloseable {
     private long appendLegacyRecord(long offset, long timestamp, ByteBuffer key, ByteBuffer value, byte magic) throws IOException {
         ensureOpenForRecordAppend();
 
+        // 旧版 record 大小不包含外层日志条目的 LOG_OVERHEAD，后续 recordWritten 会补上。
         int size = LegacyRecord.recordSize(magic, key, value);
+        // 旧格式每条 record 都有一层日志条目头，toInnerOffset 处理压缩 v1 的相对 offset 语义。
         AbstractLegacyRecordBatch.writeHeader(appendStream, toInnerOffset(offset), size);
 
         if (timestampType == TimestampType.LOG_APPEND_TIME)
+            // LogAppendTime 模式下，broker/构建器使用日志追加时间覆盖 record 创建时间。
             timestamp = logAppendTime;
         long crc = LegacyRecord.write(appendStream, magic, timestamp, key, value, CompressionType.NONE, timestampType);
+        // Records.LOG_OVERHEAD 是旧格式日志条目头开销，需计入未压缩 record 大小统计。
         recordWritten(offset, timestamp, size + Records.LOG_OVERHEAD);
         return crc;
     }
@@ -833,8 +852,10 @@ public class MemoryRecordsBuilder implements AutoCloseable {
     /**
      * Check if we have room for a new record containing the given key/value pair. If no records have been
      * appended, then this returns true.
+     * 检查当前 batch 是否还能容纳一条 byte[] record；实际判断委托给 ByteBuffer 版本。
      */
     public boolean hasRoomFor(long timestamp, byte[] key, byte[] value, Header[] headers) {
+        // 保留 null key/value 语义，仅把非 null byte[] 包装成 ByteBuffer 以便统一估算大小。
         return hasRoomFor(timestamp, wrapNullable(key), wrapNullable(value), headers);
     }
 
@@ -845,25 +866,36 @@ public class MemoryRecordsBuilder implements AutoCloseable {
      * Note that the return value is based on the estimate of the bytes written to the compressor, which may not be
      * accurate if compression is used. When this happens, the following append may cause dynamic buffer
      * re-allocation in the underlying byte buffer stream.
+     * 判断当前 batch 是否还有空间追加下一条 record；压缩场景基于估算值，可能不是精确字节数。
      */
     public boolean hasRoomFor(long timestamp, ByteBuffer key, ByteBuffer value, Header[] headers) {
+        // 如果 batch 已经满了，返回 false
         if (isFull())
             return false;
 
         // We always allow at least one record to be appended (the ByteBufferOutputStream will grow as needed)
+        // 如果当前 batch 还没有任何 record，直接允许写入
+        // 这样即使单条 record 大于 batch.size，也能形成非空 batch；最终仍受 max.request.size/broker 限制约束。
         if (numRecords == 0)
             return true;
 
         final int recordSize;
         if (magic < RecordBatch.MAGIC_VALUE_V2) {
+            // magic v0/v1 旧格式：每条日志记录大小 = 日志条目头开销 + LegacyRecord 自身大小。
+            // Records.LOG_OVERHEAD 表示旧格式日志条目的 offset/size 等外层包装开销。
             recordSize = Records.LOG_OVERHEAD + LegacyRecord.recordSize(magic, key, value);
         } else {
+            // magic v2 及以后：record 使用相对 offset/timestamp 编码，估算时需要下一条记录的 delta。
             int nextOffsetDelta = lastOffset == null ? 0 : (int) (lastOffset - baseOffset + 1);
+            // timestampDelta 是相对本 batch 第一条 record 时间戳的差值，参与变长编码大小估算。
             long timestampDelta = baseTimestamp == null ? 0 : timestamp - baseTimestamp;
+            // DefaultRecord.sizeInBytes 估算 v2 record 的编码大小，包含 key/value/header 以及 delta 字段。
             recordSize = DefaultRecord.sizeInBytes(nextOffsetDelta, timestampDelta, key, value, headers);
         }
 
         // Be conservative and not take compression of the new record into consideration.
+        // writeLimit 是该 builder 期望控制的批次大小上限；estimatedBytesWritten 是当前已写入大小估算。
+        // 新 record 不预估压缩收益，避免因为过度乐观导致 batch 过大。
         return this.writeLimit >= estimatedBytesWritten() + recordSize;
     }
 

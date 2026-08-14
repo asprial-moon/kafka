@@ -102,6 +102,7 @@ public class Sender implements Runnable {
     private final int maxRequestSize;
 
     /* the number of acknowledgements to request from the server */
+    /* acks 的典型取值：0=不等 broker 响应，1=leader 写入即确认，-1/all=等待 ISR 副本确认。 */
     /* broker 确认级别：决定 ProduceRequest 是否等待响应以及需要多少副本确认。 */
     private final short acks;
 
@@ -138,6 +139,8 @@ public class Sender implements Runnable {
     private final TransactionManager transactionManager;
 
     // A per-partition queue of batches ordered by creation time for tracking the in-flight batches
+    // in-flight 表按分区保存已交给 NetworkClient、但尚未最终完成的 batch。
+    // 同一分区内列表按创建/发送顺序排列，因此超时扫描遇到第一个未过期 batch 后可以停止。
     // 按分区记录已发送但尚未最终完成的批次，用于超时检查、顺序控制、失败清理和事务状态推进。
     private final Map<TopicPartition, List<ProducerBatch>> inFlightBatches;
 
@@ -172,25 +175,30 @@ public class Sender implements Runnable {
     }
 
     public List<ProducerBatch> inFlightBatches(TopicPartition tp) {
+        // 返回指定分区当前仍在网络层等待结果的 batch；没有记录时返回空列表，避免暴露 null。
         return inFlightBatches.containsKey(tp) ? inFlightBatches.get(tp) : new ArrayList<>();
     }
 
     private void maybeRemoveFromInflightBatches(ProducerBatch batch) {
+        // batch 已经完成、失败或重新入队后，需要从 in-flight 跟踪表移除，避免后续超时扫描重复处理。
         List<ProducerBatch> batches = inFlightBatches.get(batch.topicPartition);
         if (batches != null) {
             batches.remove(batch);
             if (batches.isEmpty()) {
+                // 分区下没有在途 batch 后移除 map 项，保持 in-flight 状态紧凑。
                 inFlightBatches.remove(batch.topicPartition);
             }
         }
     }
 
     private void maybeRemoveAndDeallocateBatch(ProducerBatch batch) {
+        // 网络层已不再持有该 batch 时，既移除 in-flight 跟踪，也归还底层 ByteBuffer。
         maybeRemoveFromInflightBatches(batch);
         this.accumulator.completeAndDeallocateBatch(batch);
     }
 
     private void maybeRemoveAndDeallocateBatchLater(ProducerBatch batch) {
+        // batch 逻辑上已完成，但网络层可能仍持有 buffer 引用；先标记完成，稍后再释放内存。
         maybeRemoveFromInflightBatches(batch);
         this.accumulator.completeBatch(batch);
     }
@@ -209,7 +217,9 @@ public class Sender implements Runnable {
                 Iterator<ProducerBatch> iter = partitionInFlightBatches.iterator();
                 while (iter.hasNext()) {
                     ProducerBatch batch = iter.next();
+                    // delivery.timeout.ms 从 batch 创建时开始计时，覆盖排队、发送、重试和等待响应全过程。
                     if (batch.hasReachedDeliveryTimeout(accumulator.getDeliveryTimeoutMs(), now)) {
+                        // 已过期 batch 从 in-flight 列表摘除，后续会统一 failBatch 唤醒用户 Future/callback。
                         iter.remove();
                         // expireBatches is called in Sender.sendProducerData, before client.poll.
                         // The !batch.isDone() invariant should always hold. An IllegalStateException
@@ -217,15 +227,19 @@ public class Sender implements Runnable {
                         if (!batch.isDone()) {
                             expiredBatches.add(batch);
                         } else {
+                            // 在进入响应处理前，in-flight 列表中不应出现已完成 batch；出现说明状态维护有 bug。
                             throw new IllegalStateException(batch.topicPartition + " batch created at " +
                                 batch.createdMs + " gets unexpected final state " + batch.finalState());
                         }
                     } else {
+                        // 同一分区的 in-flight batch 按创建时间有序；当前未过期，后续更晚创建的 batch 也不会过期。
+                        // 记录这个 batch 的到期时间，供 Sender 计算下一次 poll 最长等待时间。
                         accumulator.maybeUpdateNextBatchExpiryTime(batch);
                         break;
                     }
                 }
                 if (partitionInFlightBatches.isEmpty()) {
+                    // 清理空分区队列，避免后续扫描无意义 map 项。
                     batchIt.remove();
                 }
             }
@@ -235,6 +249,7 @@ public class Sender implements Runnable {
 
     private void addToInflightBatches(List<ProducerBatch> batches) {
         for (ProducerBatch batch : batches) {
+            // drain 出来的 batch 即将进入 NetworkClient，按 topic-partition 追加到在途列表尾部。
             List<ProducerBatch> inflightBatchList = inFlightBatches.computeIfAbsent(batch.topicPartition,
                 k -> new ArrayList<>());
             inflightBatchList.add(batch);
@@ -242,12 +257,14 @@ public class Sender implements Runnable {
     }
 
     public void addToInflightBatches(Map<Integer, List<ProducerBatch>> batches) {
+        // drain 结果按 brokerId 分组；in-flight 跟踪按 topic-partition 分组，因此这里需要展开转换。
         for (List<ProducerBatch> batchList : batches.values()) {
             addToInflightBatches(batchList);
         }
     }
 
     private boolean hasPendingTransactionalRequests() {
+        // 只有事务仍在进行且事务管理器还有请求时，关闭阶段才需要继续 runOnce 推进事务控制流。
         return transactionManager != null && transactionManager.hasPendingRequests() && transactionManager.hasOngoingTransaction();
     }
 
@@ -878,12 +895,14 @@ public class Sender implements Runnable {
      * e.g "NETWORK_EXCEPTION. Error Message: Disconnected from node 0"
      */
     private String formatErrMsg(ProduceResponse.PartitionResponse response) {
+        // response.error 是协议错误码；errorMessage 是 broker 返回的可选明细，拼接后便于日志定位。
         String errorMessageSuffix = (response.errorMessage == null || response.errorMessage.isEmpty()) ?
                 "" : String.format(". Error Message: %s", response.errorMessage);
         return String.format("%s%s", response.error, errorMessageSuffix);
     }
 
     private void reenqueueBatch(ProducerBatch batch, long currentTimeMs) {
+        // 可重试失败不会触发用户 callback，而是把 batch 放回 accumulator 等待下一轮 Sender 发送。
         // 将可重试批次放回 accumulator，等待重试退避、metadata 或 broker 状态满足后再次发送。
         this.accumulator.reenqueue(batch, currentTimeMs);
         maybeRemoveFromInflightBatches(batch);
@@ -891,6 +910,7 @@ public class Sender implements Runnable {
     }
 
     private void completeBatch(ProducerBatch batch, ProduceResponse.PartitionResponse response) {
+        // 成功完成入口：推进事务/幂等状态，完成 batch 内每条 record 的 Future/callback，并释放内存。
         if (transactionManager != null) {
             // 事务/幂等 producer 需要在 batch 成功后推进 sequence、in-flight 和事务状态。
             transactionManager.handleCompletedBatch(batch, response);
@@ -910,6 +930,8 @@ public class Sender implements Runnable {
                            ProduceResponse.PartitionResponse response,
                            boolean adjustSequenceNumbers,
                            boolean deallocateBatch) {
+        // 将 broker 分区级错误和可选 record 级错误转换成用户可见异常。
+        // adjustSequenceNumbers 表示是否还能安全修正后续 batch 的 sequence；deallocateBatch 表示是否可立即释放 buffer。
         final RuntimeException topLevelException;
         // 把 broker 的分区级错误转换成用户 Future/callback 可感知的异常类型。
         if (response.error == Errors.TOPIC_AUTHORIZATION_FAILED)
@@ -977,6 +999,7 @@ public class Sender implements Runnable {
         boolean adjustSequenceNumbers,
         boolean deallocateBatch
     ) {
+        // 没有 record 级异常明细时，batch 内所有 record 共用同一个顶层异常。
         // 没有 record 级异常映射时，batch 内所有 record 共享同一个异常。
         failBatch(batch, topLevelException, batchIndex -> topLevelException, adjustSequenceNumbers, deallocateBatch);
     }
@@ -988,6 +1011,7 @@ public class Sender implements Runnable {
         boolean adjustSequenceNumbers,
         boolean deallocateBatch
     ) {
+        // 最终失败入口：completeExceptionally 成功后，用户 Future.get 和 callback 都会收到异常。
         // 记录错误指标，按 topic 维度统计失败记录数。
         this.sensors.recordErrors(batch.topicPartition.topic(), batch.recordCount);
 
@@ -1043,6 +1067,7 @@ public class Sender implements Runnable {
      * 将按 broker 聚合好的批次转换为 ProduceRequest 并逐个发送。
      */
     private void sendProduceRequests(Map<Integer, List<ProducerBatch>> collated, long now) {
+        // collated 的 key 是 brokerId，value 是该 broker 作为 leader 的分区批次列表。
         for (Map.Entry<Integer, List<ProducerBatch>> entry : collated.entrySet())
             sendProduceRequest(now, entry.getKey(), acks, requestTimeoutMs, entry.getValue());
     }
@@ -1052,14 +1077,17 @@ public class Sender implements Runnable {
      * 为一个目标 broker 构造 ProduceRequest：按 topic/partition 填充 records，并注册响应回调。
      */
     private void sendProduceRequest(long now, int destination, short acks, int timeout, List<ProducerBatch> batches) {
+        // 一个目标 broker 对应一个 ProduceRequest；空 batch 列表无需构造网络请求。
         if (batches.isEmpty())
             return;
 
+        // 响应只携带 topic/partition 级结果；这里保存映射，回调中才能定位到原 ProducerBatch。
         // 用于响应回来时从 TopicPartition 找回原始 ProducerBatch。
         final Map<TopicPartition, ProducerBatch> recordsByPartition = new HashMap<>(batches.size());
         // 为本次请求中的 topic 获取 topicId；旧 broker 或未知 topicId 时会使用 ZERO_UUID。
         Map<String, Uuid> topicIds = topicIdsForBatches(batches);
 
+        // ProduceRequest 协议结构是 topic -> partition -> records。
         // ProduceRequest 的 topic 集合，后续按 topic 聚合多个 partition 的 records。
         ProduceRequestData.TopicProduceDataCollection tpd = new ProduceRequestData.TopicProduceDataCollection();
         for (ProducerBatch batch : batches) {
@@ -1083,6 +1111,7 @@ public class Sender implements Runnable {
             tpData.partitionData().add(new ProduceRequestData.PartitionProduceData()
                     .setIndex(tp.partition())
                     .setRecords(records));
+            // 保存反查关系：handleProduceResponse 会用 TopicPartition 找回这里的 batch。
             recordsByPartition.put(tp, batch);
             // 标记 batch 已进入网络发送链路，后续超时检查会把它当作 in-flight 批次处理。
             batch.setInflight(true);
@@ -1117,6 +1146,7 @@ public class Sender implements Runnable {
         // NetworkClient 使用字符串形式的 nodeId 标识目标连接。
         String nodeId = Integer.toString(destination);
         // acks != 0 时需要等待响应；acks = 0 时请求发送完成即可在本地完成 batch。
+        // newClientRequest 的 expectResponse 参数由 acks != 0 决定；acks=0 时不会等待 broker response。
         ClientRequest clientRequest = client.newClientRequest(nodeId, requestBuilder, now, acks != 0,
                 requestTimeoutMs, callback);
         // 提交给 NetworkClient；真正的 socket 写入由后续 client.poll() 驱动。
@@ -1125,6 +1155,7 @@ public class Sender implements Runnable {
     }
 
     private Map<String, Uuid> topicIdsForBatches(List<ProducerBatch> batches) {
+        // Uuid.ZERO_UUID 是 Kafka 协议中的“未知/未使用 topicId”占位值。
         // 从本地 metadata 快照中为每个 topic 取 topicId；缺失时使用 ZERO_UUID 保持对旧协议兼容。
         return batches.stream()
                 .collect(Collectors.toMap(
@@ -1154,57 +1185,80 @@ public class Sender implements Runnable {
 
     /**
      * A collection of sensors for the sender
+     * Sender 使用的一组指标传感器，负责把发送链路中的 batch、record、请求延迟、重试和错误转换为 producer metrics。
      */
     private static class SenderMetrics {
+        // 全局重试记录数指标；按 record 数记录，而不是按 batch 数。
         public final Sensor retrySensor;
+        // 全局发送失败记录数指标。
         public final Sensor errorSensor;
+        // record 在 accumulator 中排队到被 drain 的等待时间。
         public final Sensor queueTimeSensor;
+        // ProduceRequest 从发送到收到响应的请求耗时。
         public final Sensor requestTimeSensor;
+        // 每个 ProduceRequest 携带的 record 数。
         public final Sensor recordsPerRequestSensor;
+        // ProducerBatch 估算字节大小。
         public final Sensor batchSizeSensor;
+        // batch 实际/估算压缩率。
         public final Sensor compressionRateSensor;
+        // batch 内最大单条 record 大小，用于观察大消息。
         public final Sensor maxRecordSizeSensor;
+        // batch 因 MESSAGE_TOO_LARGE 被拆分的次数/速率。
         public final Sensor batchSplitSensor;
+        // 指标注册表，集中创建和查询全局/topic/node 维度的 metric。
         private final SenderMetricsRegistry metrics;
+        // 记录指标时使用的时间源。
         private final Time time;
 
         public SenderMetrics(SenderMetricsRegistry metrics, Metadata metadata, KafkaClient client, Time time) {
             this.metrics = metrics;
             this.time = time;
 
+            // batch-size：观察每个 batch 的发送体大小，帮助判断 batch.size 是否合适。
             this.batchSizeSensor = metrics.sensor("batch-size");
             this.batchSizeSensor.add(metrics.batchSizeAvg, new Avg());
             this.batchSizeSensor.add(metrics.batchSizeMax, new Max());
 
+            // compression-rate：观察压缩效果，值越低通常表示压缩收益越明显。
             this.compressionRateSensor = metrics.sensor("compression-rate");
             this.compressionRateSensor.add(metrics.compressionRateAvg, new Avg());
 
+            // queue-time：观察 batch 在客户端内存中等待多久才被 Sender drain。
             this.queueTimeSensor = metrics.sensor("queue-time");
             this.queueTimeSensor.add(metrics.recordQueueTimeAvg, new Avg());
             this.queueTimeSensor.add(metrics.recordQueueTimeMax, new Max());
 
+            // request-time：观察 ProduceRequest 网络往返和 broker 处理耗时。
             this.requestTimeSensor = metrics.sensor("request-time");
             this.requestTimeSensor.add(metrics.requestLatencyAvg, new Avg());
             this.requestTimeSensor.add(metrics.requestLatencyMax, new Max());
 
+            // records-per-request：观察一次请求合并了多少 record，体现批处理效果。
             this.recordsPerRequestSensor = metrics.sensor("records-per-request");
             this.recordsPerRequestSensor.add(new Meter(metrics.recordSendRate, metrics.recordSendTotal));
             this.recordsPerRequestSensor.add(metrics.recordsPerRequestAvg, new Avg());
 
+            // record-retries：记录发生重试的 record 数和速率。
             this.retrySensor = metrics.sensor("record-retries");
             this.retrySensor.add(new Meter(metrics.recordRetryRate, metrics.recordRetryTotal));
 
+            // errors：记录最终失败的 record 数和速率。
             this.errorSensor = metrics.sensor("errors");
             this.errorSensor.add(new Meter(metrics.recordErrorRate, metrics.recordErrorTotal));
 
+            // record-size：记录 batch 中最大 record 大小的分布。
             this.maxRecordSizeSensor = metrics.sensor("record-size");
             this.maxRecordSizeSensor.add(metrics.recordSizeMax, new Max());
             this.maxRecordSizeSensor.add(metrics.recordSizeAvg, new Avg());
 
+            // requestsInFlight 是当前 NetworkClient 中尚未完成的请求数。
             this.metrics.addMetric(metrics.requestsInFlight, (config, now) -> client.inFlightRequestCount());
+            // metadataAge 表示距离最近一次成功 metadata 更新过去了多少秒。
             this.metrics.addMetric(metrics.metadataAge,
                 (config, now) -> (now - metadata.lastSuccessfulUpdate()) / 1000.0);
 
+            // batch-split-rate：记录大批次拆分频率，通常和 max.request.size/batch.size/消息大小有关。
             this.batchSplitSensor = metrics.sensor("batch-split-rate");
             this.batchSplitSensor.add(new Meter(metrics.batchSplitRate, metrics.batchSplitTotal));
         }
@@ -1212,9 +1266,11 @@ public class Sender implements Runnable {
         private void maybeRegisterTopicMetrics(String topic) {
             // if one sensor of the metrics has been registered for the topic,
             // then all other sensors should have been registered; and vice versa
+            // topic 维度指标按需懒注册：某 topic 第一次被发送时，一次性注册该 topic 的所有相关指标。
             String topicRecordsCountName = "topic." + topic + ".records-per-batch";
             Sensor topicRecordCount = this.metrics.getSensor(topicRecordsCountName);
             if (topicRecordCount == null) {
+                // topic 作为 metric tag，便于按主题维度查看吞吐、压缩、重试和错误。
                 Map<String, String> metricTags = Collections.singletonMap("topic", topic);
 
                 topicRecordCount = this.metrics.sensor(topicRecordsCountName);
@@ -1250,6 +1306,7 @@ public class Sender implements Runnable {
         public void updateProduceRequestMetrics(Map<Integer, List<ProducerBatch>> batches) {
             long now = time.milliseconds();
             for (List<ProducerBatch> nodeBatch : batches.values()) {
+                // records 汇总同一个 broker 请求内的 record 数，用于 records-per-request 指标。
                 int records = 0;
                 for (ProducerBatch batch : nodeBatch) {
                     // register all per-topic metrics at once
@@ -1272,6 +1329,7 @@ public class Sender implements Runnable {
                     topicCompressionRate.record(batch.compressionRatio());
 
                     // global metrics
+                    // 全局指标不区分 topic，用于观察 producer 整体批处理质量和排队/压缩状态。
                     this.batchSizeSensor.record(batch.estimatedSizeInBytes(), now);
                     this.queueTimeSensor.record(batch.queueTimeMs(), now);
                     this.compressionRateSensor.record(batch.compressionRatio());
@@ -1284,6 +1342,7 @@ public class Sender implements Runnable {
 
         public void recordRetries(String topic, int count) {
             long now = time.milliseconds();
+            // 先记录全局重试，再补充 topic 维度重试；topic sensor 可能尚未注册，因此需要判空。
             this.retrySensor.record(count, now);
             String topicRetryName = "topic." + topic + ".record-retries";
             Sensor topicRetrySensor = this.metrics.getSensor(topicRetryName);
@@ -1293,6 +1352,7 @@ public class Sender implements Runnable {
 
         public void recordErrors(String topic, int count) {
             long now = time.milliseconds();
+            // 先记录全局错误，再补充 topic 维度错误；count 表示失败 record 数。
             this.errorSensor.record(count, now);
             String topicErrorName = "topic." + topic + ".record-errors";
             Sensor topicErrorSensor = this.metrics.getSensor(topicErrorName);
@@ -1302,6 +1362,7 @@ public class Sender implements Runnable {
 
         public void recordLatency(String node, long latency) {
             long now = time.milliseconds();
+            // requestTimeSensor 是全局请求延迟；node-X.latency 是单 broker 维度延迟。
             this.requestTimeSensor.record(latency, now);
             if (!node.isEmpty()) {
                 String nodeTimeName = "node-" + node + ".latency";
@@ -1312,6 +1373,7 @@ public class Sender implements Runnable {
         }
 
         void recordBatchSplit() {
+            // MESSAGE_TOO_LARGE 后拆分 batch 时记录，用于发现批次过大或单条消息过大的问题。
             this.batchSplitSensor.record();
         }
     }
