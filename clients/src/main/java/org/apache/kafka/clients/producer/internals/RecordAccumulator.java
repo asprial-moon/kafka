@@ -80,6 +80,7 @@ public class RecordAccumulator {
     private final ExponentialBackoff retryBackoff;
     private final int deliveryTimeoutMs;
     private final long partitionAvailabilityTimeoutMs;  // latency threshold for marking partition temporary unavailable
+    // adaptive partitioning 中判定分区暂时不可用的延迟阈值：broker 超过该时长无法 drain，分区器将避开该分区。
     private final boolean partitionerRackAware;
     private final String rack;
     private final boolean enableAdaptivePartitioning;
@@ -694,24 +695,41 @@ public class RecordAccumulator {
 
     /**
      * Add the leader to the ready nodes if the batch is ready
+     * 单个分区的 ready 判定核心：若队头批次满足发送条件，就把该分区的 leader broker 加入 readyNodes。
+     * 发送条件（任一满足即可）：批次已满、等待时间达到 linger.ms / retry backoff、BufferPool 内存耗尽、
+     * accumulator 已关闭、有线程正在 flush()、事务正在收尾（completing）。
      *
      * @param exhausted 'true' is the buffer pool is exhausted
+     *                  BufferPool 是否耗尽且有线程阻塞等待内存；此时所有批次视为 ready，尽快发送以释放内存。
      * @param part The partition
+     *             当前检查的分区。
      * @param leader The leader for the partition
+     *               该分区当前的 leader broker；ready 时它会被加入 readyNodes。
      * @param waitedTimeMs How long batch waited
+     *                     队头批次已在队列中等待的时间。
      * @param backingOff Is backing off
+     *                   是否处于重试退避期；退避期内不可发送。
      * @param backoffAttempts Number of attempts for calculating backoff delay
+     *                        批次已尝试次数，用于计算指数退避时长。
      * @param full Is batch full
+     *             批次是否已满（或队列中还有后续批次）。
      * @param nextReadyCheckDelayMs The delay for next check
+     *                              下次 ready 检查的最短等待时间，本方法可能进一步缩小它。
      * @param readyNodes The set of ready nodes (to be filled in)
+     *                   可发送数据的目标 broker 集合，本方法会把 leader 加入其中。
      * @return The delay for next check
+     *         更新后的下次 ready 检查延迟。
      */
     private long batchReady(boolean exhausted, TopicPartition part, Node leader,
                             long waitedTimeMs, boolean backingOff, int backoffAttempts,
                             boolean full, long nextReadyCheckDelayMs, Set<Node> readyNodes) {
+        // 该 broker 已在 ready 集合（一个 broker 只需加一次），或分区被 mute（保序）时，跳过本分区。
         if (!readyNodes.contains(leader) && !isMuted(part)) {
+            // 重试批次要等的退避时间随 attempts 指数增长；首次发送的批次只需等到 linger.ms 到期。
             long timeToWaitMs = backingOff ? retryBackoff.backoff(backoffAttempts > 0 ? backoffAttempts - 1 : 0) : lingerMs;
+            // 等待时间已超过目标等待时间，说明 linger 或退避已到期。
             boolean expired = waitedTimeMs >= timeToWaitMs;
+            // 事务进入 committing/aborting 阶段时，剩余批次也要尽快发出去。
             boolean transactionCompleting = transactionManager != null && transactionManager.isCompleting();
             boolean sendable = full
                     || expired
@@ -720,12 +738,16 @@ public class RecordAccumulator {
                     || flushInProgress()
                     || transactionCompleting;
             if (sendable && !backingOff) {
+                // 满足发送条件且不在退避期：该分区可以 drain，记录 leader broker。
                 readyNodes.add(leader);
             } else {
+                // 还差多久可以发送；poll 最多等这么久，到点后回来重新检查。
                 long timeLeftMs = Math.max(timeToWaitMs - waitedTimeMs, 0);
                 // Note that this results in a conservative estimate since an un-sendable partition may have
                 // a leader that will later be found to have sendable data. However, this is good enough
                 // since we'll just wake up and then sleep again for the remaining time.
+                // 这是个保守估计：当前不可发送的分区，其 leader 之后可能因为别的分区而变得可发送；
+                // 但这没有关系，因为到点唤醒后只睡掉了剩余时间，随后会重新进入下一轮检查。
                 nextReadyCheckDelayMs = Math.min(timeLeftMs, nextReadyCheckDelayMs);
             }
         }
@@ -736,21 +758,37 @@ public class RecordAccumulator {
      * Iterate over partitions to see which one have batches ready and collect leaders of those
      * partitions into the set of ready nodes.  If partition has no leader, add the topic to the set
      * of topics with no leader.  This function also calculates stats for adaptive partitioning.
+     * 遍历某个 topic 的所有分区队列，逐个判断其队头批次是否可以发送（ready）：
+     * <ul>
+     * <li>ready 的分区：把 leader broker 收集进 readyNodes，Sender 随后会按 broker drain 这些分区；</li>
+     * <li>有数据但 leader 未知的分区：把 topic 收集进 unknownLeaderTopics，Sender 据此触发 metadata 更新；</li>
+     * <li>同时为 adaptive partitioning 收集各分区队列长度和 leader rack，供内置分区器评估负载。</li>
+     * </ul>
      *
      * @param metadataSnapshot      The cluster metadata
+     *                             当前元数据快照，提供分区 leader 与 leader epoch。
      * @param nowMs                 The current time
+     *                             当前时间，用于计算批次等待时长和退避。
      * @param topic                 The topic
+     *                             当前检查的 topic。
      * @param topicInfo             The topic info
+     *                             该 topic 的 TopicInfo，包含分区队列和内置分区器。
      * @param nextReadyCheckDelayMs The delay for next check
+     *                             到目前为止下一次 ready 检查的最短等待时间，本方法可能进一步缩小。
      * @param readyNodes            The set of ready nodes (to be filled in)
+     *                             可发送数据的目标 broker 集合，本方法会向其填充 leader。
      * @param unknownLeaderTopics   The set of topics with no leader (to be filled in)
+     *                             有数据但 leader 未知的 topic 集合，本方法会向其填充 topic。
      * @return The delay for next check
+     *         更新后的下一次 ready 检查延迟。
      */
     private long partitionReady(MetadataSnapshot metadataSnapshot, long nowMs, String topic,
                                 TopicInfo topicInfo,
                                 long nextReadyCheckDelayMs, Set<Node> readyNodes, Set<String> unknownLeaderTopics) {
+        // 该 topic 的分区 -> 批次队列映射；map 中可能存在空队列条目（当前不会被清理）。
         ConcurrentMap<Integer, Deque<ProducerBatch>> batches = topicInfo.batches;
         // Collect the queue sizes for available partitions to be used in adaptive partitioning.
+        // adaptive partitioning 需要每个可用分区的队列长度来评估负载，仅在该特性开启时收集。
         int[] queueSizes = null;
         int[] partitionIds = null;
         String[] partitionLeaderRacks = null;
@@ -760,18 +798,22 @@ public class RecordAccumulator {
             // do uniform.  The reason is that we build queue sizes from the batches map,
             // and if an entry is missing in the batches map, then adaptive partitioning logic
             // won't know about it and won't switch to it.
+            // 只有当每个分区都在 batches map 中有条目（即所有分区都被调度过）时才启用 adaptive。
+            // 否则缺失条目的分区在负载统计中不可见，内置分区器永远不会切换到它；此时退化为均匀分发。
             queueSizes = new int[batches.size()];
             partitionIds = new int[queueSizes.length];
             partitionLeaderRacks = new String[queueSizes.length];
         }
 
+        // 已收集统计的可用分区下标；leader 未知或分区被判不可用（回退下标）时不推进。
         int queueSizesIndex = -1;
+        // BufferPool 有线程排队等内存时，所有批次都视为 ready，优先把数据发出去释放内存。
         boolean exhausted = this.free.queued() > 0;
         for (Map.Entry<Integer, Deque<ProducerBatch>> entry : batches.entrySet()) {
             TopicPartition part = new TopicPartition(topic, entry.getKey());
             // Advance queueSizesIndex so that we properly index available
             // partitions.  Do it here so that it's done for all code paths.
-
+            // 只要 leader 已知且需要统计，就先把下标推进并对齐三个数组（所有代码路径统一在此处理）。
             Node leader = metadataSnapshot.cluster().leaderFor(part);
             if (leader != null && queueSizes != null) {
                 ++queueSizesIndex;
@@ -788,36 +830,47 @@ public class RecordAccumulator {
             final int dequeSize;
             final boolean full;
 
+            // 该分区的 leader epoch；重试批次用它和上次尝试比较，判断 leader 是否已经切换。
             OptionalInt leaderEpoch = metadataSnapshot.leaderEpochFor(part);
 
             // This loop is especially hot with large partition counts. So -
-
+            // 分区数很多时这段循环是热点路径，所以这里特别小心：
             // 1. We should avoid code that increases synchronization between application thread calling
             // send(), and background thread running runOnce(), see https://issues.apache.org/jira/browse/KAFKA-16226
-
+            // 1. 避免增加调用 send() 的应用线程与后台 Sender 线程（runOnce）之间的锁竞争，见 KAFKA-16226；
             // 2. We are careful to only perform the minimum required inside the
             // synchronized block, as this lock is also used to synchronize producer threads
             // attempting to append() to a partition/batch.
+            // 2. 锁内只做最少必要的工作——这个 deque 锁同时被 append() 的 producer 线程使用。
 
             synchronized (deque) {
                 // Deques are often empty in this path, esp with large partition counts,
                 // so we exit early if we can.
+                // 分区数多时队列经常为空；队头没有批次就尽快跳过，减少锁内停留时间。
                 ProducerBatch batch = deque.peekFirst();
                 if (batch == null) {
                     continue;
                 }
 
+                // 队头批次在队列中的等待时长，是 linger / backoff 判断的基础。
                 waitedTimeMs = batch.waitedTimeMs(nowMs);
+                // 批次若是重试批次，更新其看到的 leader epoch，供判断重试期间 leader 是否变化。
                 batch.maybeUpdateLeaderEpoch(leaderEpoch);
+                // 重试批次在 retry backoff 到期前不能再次发送。
                 backingOff = shouldBackoff(batch.hasLeaderChangedForTheOngoingRetry(), batch, waitedTimeMs);
+                // 批次已尝试次数，用于计算指数退避时长。
                 backoffAttempts = batch.attempts();
+                // 队列长度；>1 表示队头批次之后还有排队批次，即使队头未满也应尽快发送。
                 dequeSize = deque.size();
+                // 批次已满或队列中还有后续批次时视为 full，可以发送。
                 full = dequeSize > 1 || batch.isFull();
             }
 
             if (leader == null) {
                 // This is a partition for which leader is not known, but messages are available to send.
                 // Note that entries are currently not removed from batches when deque is empty.
+                // 有数据但 leader 未知：记下 topic，Sender 会请求 metadata 更新后再重试。
+                // 注意：队列为空时 batches map 中的条目目前不会被移除。
                 unknownLeaderTopics.add(part.topic());
             } else {
                 if (queueSizes != null)
@@ -825,17 +878,23 @@ public class RecordAccumulator {
                 if (partitionAvailabilityTimeoutMs > 0) {
                     // Check if we want to exclude the partition from the list of available partitions
                     // if the broker hasn't responded for some time.
+                    // adaptive partitioning 下，若 broker 长时间无法 drain（ready 与 drain 时间差超过阈值），
+                    // 说明它可能卡顿，把该分区从可用分区列表中排除，分区器会避开它。
                     NodeLatencyStats nodeLatencyStats = nodeStats.get(leader.id());
                     if (nodeLatencyStats != null) {
                         // NOTE: there is no synchronization between reading metrics,
                         // so we read ready time first to avoid accidentally marking partition
                         // unavailable if we read while the metrics are being updated.
+                        // 指标读写之间没有同步：先读 readyTimeMs 再读 drainTimeMs，
+                        // 避免恰好在指标更新中间读到不一致的值而误判分区不可用。
                         long readyTimeMs = nodeLatencyStats.readyTimeMs;
                         if (readyTimeMs - nodeLatencyStats.drainTimeMs > partitionAvailabilityTimeoutMs)
+                            // 分区被判不可用：回退统计下标，让最后一个已收集的位置可被覆盖/丢弃。
                             --queueSizesIndex;
                     }
                 }
 
+                // 该分区的 ready 判定交给 batchReady：满、linger 到期、内存耗尽、flush/close 等条件之一满足即可发送。
                 nextReadyCheckDelayMs = batchReady(exhausted, part, leader, waitedTimeMs, backingOff,
                     backoffAttempts, full, nextReadyCheckDelayMs, readyNodes);
             }
@@ -844,6 +903,8 @@ public class RecordAccumulator {
         // We've collected the queue sizes for partitions of this topic, now we can calculate
         // load stats.  NOTE: the stats are calculated in place, modifying the
         // queueSizes array.
+        // 收集完该 topic 所有分区队列长度后，就地计算负载统计（原地修改 queueSizes 数组），
+        // 供 BuiltInPartitioner 在后续 append 选择 sticky 分区时避开高负载分区或慢 broker。
         topicInfo.builtInPartitioner.updatePartitionLoadStats(queueSizes, partitionIds, partitionLeaderRacks, queueSizesIndex + 1);
         return nextReadyCheckDelayMs;
     }
