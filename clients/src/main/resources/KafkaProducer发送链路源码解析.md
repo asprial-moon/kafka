@@ -223,7 +223,7 @@ flowchart TD
     B -->|否| C{"② 配置了自定义 Partitioner?"}
     C -->|是| P2["partitioner.partition(...)<br/>负数抛 IllegalArgumentException"]
     C -->|否| D{"③ 有 key 且未忽略 key?"}
-    D -->|是| P3["BuiltInPartitioner.partitionForKey<br/>= murmur2(key) % 分区数<br/>(相同 key 永远进同一分区)"]
+    D -->|是| P3["BuiltInPartitioner.partitionForKey<br/>= toPositive(murmur2(serializedKey)) % 分区数<br/>(key 序列化结果与分区数不变时稳定)"]
     D -->|否| P4["返回 UNKNOWN_PARTITION<br/>由 RecordAccumulator 的内置分区器决定："]
     P4 --> P5["sticky：粘住一个分区写<br/>直到 batch 满或累计 stickyBatchSize 字节再切换"]
     P4 --> P6["adaptive（KIP-794）：切换时还参考<br/>各分区队列长度、leader rack、<br/>broker 可用性（partitionReady 中统计）"]
@@ -651,23 +651,24 @@ sequenceDiagram
 Kafka Producer 保证 **同一分区内消息有序**，靠四层机制：
 
 ```mermaid
-flowchart LR
+flowchart TB
     subgraph L1["① 内存层：分区 FIFO 队列"]
         A["append 只往队尾追加<br/>drain 只取队头<br/>peekFirst 决定一切"]
     end
-    subgraph L2["② 发送层：mute 静音"]
+    subgraph P1["② 非幂等保守路径"]
         B["max.in.flight=1 时<br/>drain 后 mutePartition<br/>前序批次完成后 unmute<br/>后批不可能越过前批"]
     end
-    subgraph L3["③ 协议层：sequence"]
-        C["幂等时每分区独立递增<br/>baseSequence<br/>broker 拒收乱序/重复批次"]
+    subgraph P2["③ 幂等路径"]
+        C["producerId + epoch + baseSequence<br/>每分区独立递增<br/>broker 去重并校验顺序"]
     end
-    subgraph L4["④ 回调层：顺序保证"]
+    subgraph L4["④ 回调层：完成通知"]
         D["同分区 callback 按发送顺序执行<br/>(batch.complete 顺序触发<br/>thunks)"]
     end
-    A --> B --> C --> D
+    A --> B --> D
+    A --> C --> D
 ```
 
-- `guaranteeMessageOrder = (maxInFlightRequests == 1)`（KafkaProducer.java:574）；
+- `guaranteeMessageOrder = (maxInFlightRequests == 1)`（KafkaProducer.java:574）只对应上图的非幂等保守路径；
 - 非幂等 + in-flight > 1 时：**重试可能乱序**（老批次重发时新批次可能已写入）——这是"开启幂等"的经典动机之一（幂等 + broker 端 sequence 排序，客户端可放心提高 in-flight）；
 - `DUPLICATE_SEQUENCE_NUMBER` 按成功处理的逻辑也属于这层（第 12.2 节）。
 

@@ -32,8 +32,8 @@
 
 Kafka 4.x 的消费端是 **双协议并存** 的架构。`KafkaConsumer` 是统一门面，根据 `group.protocol` 配置在构造时选择底层实现（`KafkaConsumer.java:543` 的 `ConsumerDelegateCreator`）：
 
-- **`classic`（默认）**：经典消费组协议。拉取、心跳、rebalance 全部由**应用线程在 poll() 中驱动**（另有一个独立心跳线程）。实现类 `ClassicKafkaConsumer`。
-- **`consumer`（KIP-848 新协议）**：网络 IO 全部移入**后台网络线程**（`ConsumerNetworkThread`），应用线程只做"取数据"。实现类 `AsyncKafkaConsumer`。
+- **`classic`（默认）**：经典消费组协议。数据拉取与 rebalance 主路径由**应用线程在 poll() 中驱动**；心跳线程也会通过 `ConsumerNetworkClient` 推进心跳/协调器状态。实现类 `ClassicKafkaConsumer`。
+- **`consumer`（KIP-848 新协议）**：网络请求收发移入**后台网络线程**（`ConsumerNetworkThread`），应用线程负责提交事件、等待缓冲数据并完成解析。实现类 `AsyncKafkaConsumer`。
 
 两者**共用同一套拉取/解析管线**（`AbstractFetch` + `FetchBuffer` + `FetchCollector` + `CompletedFetch`），因此解压、反序列化、位点推进的逻辑完全一致——这也是本文字节 7~13 对两种协议通用的原因。
 
@@ -45,12 +45,14 @@ flowchart TB
         ASY["AsyncKafkaConsumer<br/>group.protocol=consumer"]
     end
 
-    subgraph NET_CLS["网络 IO（classic：应用线程内）"]
+    subgraph NET_CLS["网络 IO（classic：应用线程主路径 + 心跳线程）"]
         CNC["ConsumerNetworkClient<br/>驱动 NetworkClient"]
+        HBT["HeartbeatThread<br/>pollNoWakeup + heartbeat"]
     end
 
     subgraph NET_ASY["网络 IO（consumer：后台线程）"]
         CNT["ConsumerNetworkThread<br/>runOnce 事件循环"]
+        NCD["NetworkClientDelegate<br/>包 NetworkClient"]
     end
 
     subgraph COORD["组协调"]
@@ -59,10 +61,12 @@ flowchart TB
     end
 
     subgraph FETCH["拉取管线（两协议共用）"]
-        AF["AbstractFetch / Fetcher<br/>发 FetchRequest 收响应"]
+        AF["AbstractFetch<br/>prepareFetchRequests / handleFetchSuccess"]
+        FET["Fetcher<br/>(classic)"]
+        FRM["FetchRequestManager<br/>(consumer)"]
         FB["FetchBuffer<br/>按分区缓存 CompletedFetch"]
-        FCO["FetchCollector<br/>collectFetch 收集"]
         CF["CompletedFetch<br/>逐条惰性解压+反序列化"]
+        FCO["FetchCollector<br/>collectFetch 返回 Fetch"]
     end
 
     SS["SubscriptionState<br/>位点状态机"]
@@ -70,21 +74,33 @@ flowchart TB
 
     KC -->|group.protocol| CLS
     KC -->|group.protocol| ASY
-    CLS -->|poll| CNC
+    CLS -->|poll: fetch/rebalance 主路径| CNC
     CLS --> CC
-    ASY -->|事件队列| CNT
+    CLS -->|sendFetches / collectFetch| FET
+    HBT -->|共享 client<br/>心跳/协调器推进| CNC
+    ASY -->|ApplicationEvent| CNT
+    ASY -->|collectFetch| FCO
     ASY --> CMM
+    CNT --> NCD
+    CNT -->|RequestManager.poll| FRM
+    FET --> AF
+    FRM --> AF
     CNC -->|FetchRequest| BROKER
-    CNT -->|FetchRequest| BROKER
+    NCD -->|FetchRequest| BROKER
+    BROKER -->|FetchResponse| CNC
+    BROKER -->|FetchResponse| NCD
     CC -->|JoinGroup/SyncGroup| BROKER
     CMM -->|Heartbeat| BROKER
-    BROKER -->|FetchResponse| AF
-    AF --> FB
+    CNC -->|FetchResponse callback| AF
+    NCD -->|FetchResponse callback| FRM
+    AF -->|add CompletedFetch<br/>wakeup| FB
     FB --> FCO
     FCO --> CF
-    CF -->|返回 ConsumerRecords| CLS
-    CF -->|返回 ConsumerRecords| ASY
-    SS -.位点查询/推进.-> AF
+    FCO -->|Fetch| CLS
+    FCO -->|Fetch| ASY
+    CLS -->|包装/拦截| KC
+    ASY -->|包装/拦截| KC
+    SS -.->|读取 position| AF
     FCO -.推进 position.-> SS
 ```
 
@@ -110,14 +126,14 @@ flowchart LR
     U["应用线程<br/>循环调用 poll()"] -->|"coordinator.poll<br/>(rebalance/auto-commit)"| C["ConsumerCoordinator"]
     U -->|"client.poll<br/>(收发请求)"| N["ConsumerNetworkClient"]
     U -->|"fetcher.collectFetch<br/>(取数据)"| F["Fetcher"]
-    H["心跳线程 HeartbeatThread<br/>独立于 poll"] -->|"心跳/离组请求<br/>通过 client"| N
+    H["心跳线程 HeartbeatThread<br/>独立于 poll"] -->|"pollNoWakeup + 心跳/离组请求<br/>通过同一个 client"| N
     N --> NTC["NetworkClient<br/>Socket 收发"]
 ```
 
 要点：
 
-1. **网络 IO 全部发生在应用线程内**——`ConsumerNetworkClient.poll()` 直接驱动底层 `NetworkClient`（`ConsumerNetworkClient.java:252-317`）。应用不 poll，网络就停摆。
-2. **心跳线程**（`HeartbeatThread`）在后台发送心跳与 LeaveGroup，使"应用卡死但进程活着"时 broker 仍能感知（session.timeout 触发踢出）。
+1. **数据拉取与 rebalance 主路径发生在应用线程内**——`ConsumerNetworkClient.poll()` 直接驱动底层 `NetworkClient`（`ConsumerNetworkClient.java:252-317`）。应用不 poll，fetch 响应收集、rebalance 回调、自动提交等前台流程就无法继续推进。
+2. **心跳线程**（`HeartbeatThread`）也会调用 `client.pollNoWakeup()` 并发送心跳与 LeaveGroup，使"应用卡死但进程活着"时 broker 仍能感知（session.timeout 触发踢出）。
 3. 应用线程通过 `acquire()`/`release()` 的**轻量级锁**（非阻塞，CAS + 引用计数）禁止多线程并发使用同一个 consumer（`AsyncKafkaConsumer.java:2216-2233`、`ClassicKafkaConsumer` 同款实现）。多线程共享 consumer 会抛 `ConcurrentModificationException`。
 
 ### 2.2 consumer 协议（KIP-848）：应用线程 + 后台网络线程
@@ -125,15 +141,17 @@ flowchart LR
 ```mermaid
 flowchart LR
     U["应用线程 poll()"] -->|"1. ApplicationEvent<br/>经 applicationEventQueue"| NT["ConsumerNetworkThread<br/>(后台守护线程)"]
-    NT -->|"2. RequestManager.poll<br/>生成请求"| NC["NetworkClientDelegate<br/>包 NetworkClient"]
-    NC -->|"3. FetchResponse"| FB["FetchBuffer"]
-    FB -->|"4. awaitWakeup<br/>应用线程取走"| U
-    NT -->|"5. BackgroundEvent<br/>经 backgroundEventQueue"| U
+    NT -->|"2. RequestManager.poll<br/>生成请求"| RM["FetchRequestManager<br/>extends AbstractFetch"]
+    RM -->|"3. prepareFetchRequests"| NC["NetworkClientDelegate<br/>包 NetworkClient"]
+    NC -->|"4. FetchResponse callback"| RM
+    RM -->|"5. handleFetchSuccess<br/>add + wakeup"| FB["FetchBuffer"]
+    FB -->|"6. awaitWakeup<br/>应用线程取走"| U
+    NT -->|"7. BackgroundEvent<br/>经 backgroundEventQueue"| U
 ```
 
 - 应用线程与网络线程通过**两个队列**通信：`ApplicationEvent`（应用→网络：发 fetch 请求、提交位点、seek 等）和 `BackgroundEvent`（网络→应用：分配变更、错误、rebalance 回调）。
 - 网络线程主循环 `ConsumerNetworkThread.runOnce()`（`ConsumerNetworkThread.java:210-242`）：处理应用事件 → 逐个 RequestManager 生成请求 → `networkClientDelegate.poll(...)` 收发 → 清理过期事件。
-- 应用线程等待数据用 `fetchBuffer.awaitWakeup(timer)`（`AsyncKafkaConsumer.java:2018`），网络线程收到响应后 `fetchBuffer.wakeup()` 唤醒（`AbstractFetch.java:234`）。
+- 应用线程等待数据用 `fetchBuffer.awaitWakeup(timer)`（`AsyncKafkaConsumer.java:2018`），网络线程收到响应后由 `FetchRequestManager` 复用 `AbstractFetch.handleFetchSuccess()`，把 `CompletedFetch` 加入 `FetchBuffer` 并 `wakeup()` 唤醒（`AbstractFetch.java:227-234`）。
 - 好处：`poll()` 的语义不再是"驱动 IO"，而是"取回已就绪数据"；即使应用卡住，后台线程仍维持心跳，**大幅减少误踢**。代价：多一个线程与事件系统。
 
 > 注意：classic 是 4.4 的默认协议（`ConsumerConfig.java:121-123`）。本文后续主线讲 classic，KIP-848 细节在 [第 14 节](#14-kip-848-新协议asynckafkaconsumer)。
@@ -169,7 +187,7 @@ private static final ConsumerDelegateCreator CREATOR = new ConsumerDelegateCreat
 `KafkaConsumer` 的 API 面（`KafkaConsumer.java`）：
 
 - `subscribe(Collection<String>)`：**订阅模式**——由消费组自动分配分区（可能被 rebalance 移走/新增）。
-- `assign(Collection<TopicPartition>)`：**手动指派**——绕过组协调器，无 rebalance（仅 classic 支持）。
+- `assign(Collection<TopicPartition>)`：**手动指派**——绕过组协调器，无 rebalance；classic 与 consumer 两种实现都支持。
 - `unsubscribe()`：清空订阅。
 
 无论哪种模式，最终都落到 `SubscriptionState` 这个唯一事实源上（见[第 12 节](#12-位点管理subscriptionstate)）。
@@ -513,17 +531,17 @@ private CompletedFetch nextInLineFetch;   // 当前正在逐条消费的那个
 
 ### 8.1 队列语义
 
-- **completedFetches**：按分区排队的已完成拉取，**每个分区最多一个**（`prepareFetchRequests` 保证了不会重复拉同一分区）。
+- **completedFetches**：按分区排队的已完成拉取；`prepareFetchRequests` 会跳过已缓冲分区与 paused 分区，通常避免同一分区继续堆积新 fetch。注意这个约束来自拉取选择逻辑，不是 `FetchBuffer` 自身的硬去重结构。
 - **nextInLineFetch**：`FetchCollector` 逐条消费时的"当前批次指针"。一次 poll 只消费到 `max.poll.records` 为止，**没消费完的批次保留在 nextInLineFetch 跨 poll 存活**——这是"惰性解压流跨 poll 打开"的根源（zstd 专题的关键）。
 
 ### 8.2 等待/唤醒
 
 ```java
-// FetchBuffer.java:165-194  awaitWakeup：等待网络线程投递数据
-// FetchBuffer.java:196-204  wakeup：网络线程收到响应后调用
+// FetchBuffer.java:165-194  awaitWakeup：KIP-848 下应用线程等待网络线程投递数据
+// FetchBuffer.java:196-204  wakeup：FetchResponse 处理完成后唤醒等待者
 ```
 
-`wokenup` 标志 + `Condition`：应用线程 `awaitWakeup(timer)` 睡到"响应入队"或超时；`addAll` 时置位唤醒（102-114 行）。
+`wokenup` 标志 + `Condition`：KIP-848 下应用线程 `awaitWakeup(timer)` 睡到"响应入队"或超时；`addAll` 时置位唤醒（102-114 行）。classic 路径主要在应用线程自己的 `client.poll` 中等待，`wakeup()` 对等待型路径更关键。
 
 ### 8.3 清理：retainAll —— 资源释放的总闸门
 
@@ -837,8 +855,8 @@ flowchart LR
     B -->|"compressedIterator"| C["recordInputStream<br/>DefaultRecordBatch.java:273-277"]
     C -->|"Compression.of(type).build()"| D["CompressionType.ZSTD 工厂<br/>CompressionType.java:99-130"]
     D -->|"wrapForInput"| E["ZstdCompression.wrapForInput<br/>ZstdCompression.java:66-75"]
-    E --> F["ChunkedBytesStream<br/>(自定义缓冲流, 16KB)"]
-    E --> G["ZstdInputStreamNoFinalizer<br/>zstd-jni 1.5.6-10"]
+    E --> F["ChunkedBytesStream<br/>(外层，自定义缓冲流 16KB)"]
+    F --> G["input = ZstdInputStreamNoFinalizer<br/>zstd-jni 1.5.6-10"]
     G --> H["ZstdDecompressCtx<br/>native 堆外内存"]
     F --> I["StreamRecordIterator<br/>DefaultRecordBatch.java:625-663"]
     I -->|"readFrom 逐条读 Record"| J["CompletedFetch.parseRecord<br/>反序列化为 ConsumerRecord"]
@@ -994,7 +1012,7 @@ public static class FetchPosition {
 ### 12.4 seek 与暂停
 
 - `seek`：应用线程直接改 position（`seekValidated`/`seekUnvalidated`，1194-1205 行；`seekUnvalidated` 同样触发 leader epoch 校验）。
-- `pause/resume`：只影响**收集**（`FetchCollector.java:125-130` 跳过 paused 分区），不影响拉取——paused 分区的数据继续进 FetchBuffer（每个分区最多 1 批，内存有界），恢复后接着消费。
+- `pause/resume`：`pause` 后不会返回该分区记录，`FetchCollector.java:125-130` 会把已缓存的 `CompletedFetch` 放回队列；同时 `SubscriptionState.isFetchable()` 要求 `!paused`，后续新 fetch 选择会排除 paused 分区。也就是说，已进入 `FetchBuffer` 的数据会保留，`resume` 后接着消费，但不是无限继续拉取。
 
 ---
 
@@ -1213,8 +1231,10 @@ sequenceDiagram
     CF-->>FCO: 返回 ConsumerRecord 列表
     FCO->>SS: position 推进到 nextFetchOffset
     FCO->>CF: 读尽 → drain() 关闭解压流
-    FCO-->>APP: ConsumerRecords
-    APP->>CNC: transmitSends() 预取下一轮
+    FCO-->>APP: Fetch
+    APP->>FET: sendFetches() 预取下一轮
+    APP->>CNC: transmitSends()<br/>(返回 records 前发送，且不能触发 wakeup/异常)
+    APP-->>APP: 包装 ConsumerRecords 并经过拦截器
 ```
 
 KIP-848 协议下的差异版：
@@ -1224,14 +1244,17 @@ sequenceDiagram
     participant APP as 应用线程
     participant NT as ConsumerNetworkThread
     participant RM as FetchRequestManager
+    participant NC as NetworkClientDelegate
     participant FB as FetchBuffer
     participant BRK as Broker
 
     APP->>NT: AsyncPollEvent / CreateFetchRequestsEvent
-    NT->>RM: poll(currentTimeMs) → 生成请求
-    NT->>BRK: NetworkClientDelegate.poll 收发
-    BRK-->>NT: FetchResponse
-    NT->>FB: add(CompletedFetch) + wakeup()
+    NT->>RM: poll(currentTimeMs) → prepareFetchRequests
+    RM->>NC: UnsentRequest + response handler
+    NC->>BRK: NetworkClientDelegate.poll 发送 FetchRequest
+    BRK-->>NC: FetchResponse
+    NC-->>RM: handleFetchSuccess
+    RM->>FB: add(CompletedFetch) + wakeup()
     APP->>APP: fetchBuffer.awaitWakeup 被唤醒
     APP->>APP: collectFetch → 逐条解压反序列化
 ```
@@ -1787,11 +1810,11 @@ public InputStream wrapForInput(ByteBuffer buffer, byte messageVersion, BufferSu
 **为什么这样改是安全的**：
 
 1. **不改变正常路径**：正常消费流程的 close 链（drain → StreamRecordIterator.close → ChunkedBytesStream.close → 本类 close）一步不少，资源照常立即释放。
-2. **兜底只覆盖异常路径**：只有"漏 close"的对象才会走到 Cleaner，正常对象被 close 后 `released=true` 且 Cleaner 已注销，零额外开销。
+2. **兜底只覆盖对象不可达后的异常路径**：只有"漏 close 且已经没有强引用"的对象才会走到 Cleaner；正常对象被 close 后 `released=true` 且 Cleaner 已注销，零额外开销。
 3. **幂等**：`AtomicBoolean` 保证显式 close 与 Cleaner 竞争时 native 释放只发生一次（zstd-jni 的 `dctx.close()` 本身也幂等，双保险）。
 4. **线程安全**：Cleaner 线程与消费线程并发 close 的场景被 CAS 正确序列化。
 
-**效果**：路径 A（坏消息半开流）、路径 B（rebalance 丢弃）、任何未知路径的泄漏都退化为"**延迟释放**"——最坏情况是 GC 后才释放，内存峰值受限（由堆上 CompletedFetch 对象数量决定，而它本身有界），**永远不会再 OOM**。
+**效果**：路径 A（坏消息半开流）、路径 B（rebalance 丢弃）、任何未知路径中"对象已经不可达但漏 close"的泄漏都退化为"**延迟释放**"——最坏情况是 GC 后才释放。仍被 `FetchBuffer` / `CompletedFetch` 强引用的半开流不属于 Cleaner 可处理范围，必须依赖继续消费、`drain()`、`retainAll()` 或 `close()` 释放。
 
 ### 17.10 补丁配套：验证与测试
 
@@ -1901,9 +1924,11 @@ flowchart LR
     C -->|"是"| D["drain() 显式 close<br/>native 立即释放 ✅"]
     C -->|"坏消息/异常/丢弃"| E{"源码有兜底?"}
     E -->|"4.4 已修复的丢弃路径"| D
-    E -->|"半开流/历史版本"| F["漏 close → native 泄漏<br/>RSS 上涨 → OOM"]
+    E -->|"半开流仍被引用"| R["仍占用 native 内存<br/>等待消费/drain/retainAll/close"]
+    E -->|"历史版本漏 close"| F["对象不可达后仍未 close<br/>native 泄漏<br/>RSS 上涨 → OOM"]
+    R -->|"方案二熔断 drain"| D
     F -->|"方案二熔断 drain"| D
-    F -->|"方案三 Cleaner 兜底"| G["GC 时自动释放<br/>泄漏退化为延迟释放 ✅"]
+    F -->|"方案三 Cleaner 兜底"| G["对象不可达且 GC 后自动释放<br/>泄漏退化为延迟释放 ✅"]
 ```
 
 **落地建议**：
@@ -1947,4 +1972,3 @@ flowchart LR
 ---
 
 > 文档结束。生产者链路请见同目录《KafkaProducer发送链路源码解析.md》。
-
